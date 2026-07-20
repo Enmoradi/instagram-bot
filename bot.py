@@ -24,6 +24,8 @@ import time
 
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -984,14 +986,20 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # اجرا
 # ---------------------------------------------------------------------------
 async def _post_init(app):
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "شروع / منوی اصلی"),
-            BotCommand("help", "راهنما"),
-            BotCommand("id", "نمایش آی‌دی عددی من"),
-            BotCommand("admin", "پنل مدیریت (فقط ادمین)"),
-        ]
-    )
+    # دستورهای عمومی (برای همه) — بدون /admin تا پنل مخفی بماند
+    public = [
+        BotCommand("start", "شروع / منوی اصلی"),
+        BotCommand("help", "راهنما"),
+        BotCommand("id", "نمایش آی‌دی عددی من"),
+    ]
+    await app.bot.set_my_commands(public, scope=BotCommandScopeDefault())
+    # دستورهای ادمین (شامل /admin) فقط برای ادمین‌ها نمایش داده می‌شود
+    admin_cmds = public + [BotCommand("admin", "پنل مدیریت")]
+    for aid in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(aid))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("تنظیم دستورهای ادمین برای %s ناموفق: %s", aid, exc)
 
 
 def main():
