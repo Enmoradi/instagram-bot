@@ -284,13 +284,11 @@ def detect_platform(text: str):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     mode = context.user_data.get("mode")
-    chat_id = update.effective_chat.id
 
     url_match = URL_RE.search(text)
-    detected = detect_platform(text) if url_match else None
 
-    # حالت موسیقی + متن بدون لینک ⇒ جستجوی آهنگ
-    if mode == "music" and not url_match:
+    # حالت موسیقی ⇒ همیشه خروجی صوتی (چه نام آهنگ، چه لینک)
+    if mode == "music":
         await _do_music_search(update, context, text)
         return
 
