@@ -1,14 +1,12 @@
 services:
   - type: web
-    name: insta-telegram-bot
-    env: python
+    name: media-telegram-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
     envVars:
       # توکن را در داشبورد Render وارد کنید (Environment → Add Environment Variable)
       - key: BOT_TOKEN
         sync: false
-      # RENDER_EXTERNAL_URL به‌طور خودکار توسط Render تنظیم می‌شود و ربات
-      # آن را برای webhook استفاده می‌کند؛ نیازی به تنظیم WEBHOOK_URL نیست.
+      # RENDER_EXTERNAL_URL به‌طور خودکار تنظیم می‌شود و برای webhook استفاده می‌گردد.

@@ -1,9 +1,16 @@
 """
-ربات دانلود اینستاگرام برای تلگرام
-- دانلود پست، ریلز، عکس و ویدیو
-- پشتیبانی از پست‌های چندتایی (کاروسل)
-- حذف خودکار فایل‌ها بعد از ارسال (مصرف حافظه صفر)
-- اجرا در دو حالت polling (لوکال/ورکر) و webhook (هاست وب رایگان)
+ربات چندمنظوره‌ی دانلود و موسیقی برای تلگرام
+-------------------------------------------------
+سرویس‌ها (اول از منو انتخاب می‌شوند):
+  📷 اینستاگرام | 📘 فیسبوک | ▶️ یوتیوب | 🎵 موسیقی
+
+قابلیت‌ها:
+  - دانلود ویدیو/عکس از اینستاگرام، فیسبوک و یوتیوب (با yt-dlp)
+  - انتخاب خودکار بهترین کیفیت زیر ۵۰ مگابایت (سقف ربات‌های تلگرام)
+  - موسیقی: جستجو با نام آهنگ  +  تشخیص آهنگ از روی کلیپ صوتی (Shazam)
+  - حذف کامل فایل‌ها بلافاصله بعد از ارسال (مصرف حافظه ≈ صفر)
+  - پردازش همزمان درخواست‌ها برای تعداد کاربر بالا
+  - اجرا در دو حالت polling و webhook (هاست وب رایگان)
 """
 
 import asyncio
@@ -13,16 +20,30 @@ import re
 import shutil
 import tempfile
 
-import instaloader
-from telegram import Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+
+import yt_dlp
+
+# تشخیص آهنگ اختیاری است؛ اگر کتابخانه نصب نبود، ربات بدون این قابلیت کار می‌کند.
+try:
+    from shazamio import Shazam  # type: ignore
+
+    _SHAZAM_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _SHAZAM_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # پیکربندی
@@ -31,18 +52,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("insta-bot")
-# جلوگیری از لاگ‌های اضافه‌ی httpx
+logger = logging.getLogger("media-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# توکن ربات از متغیر محیطی خوانده می‌شود. اگر تنظیم نشده باشد از مقدار پیش‌فرض
-# استفاده می‌شود تا ربات همچنان کار کند (توصیه: BOT_TOKEN را در هاست تنظیم کنید).
-_DEFAULT_TOKEN = "7488688385:AAGbIEU7mf_96Lr9JwWEU216VX2aeRFFa-o"
-BOT_TOKEN = os.environ.get("BOT_TOKEN", _DEFAULT_TOKEN)
-
-# اگر WEBHOOK_URL تنظیم شده باشد، ربات در حالت webhook اجرا می‌شود؛ در غیر این
-# صورت در حالت polling. برای هاست‌های وب رایگان (مثل Render) از webhook استفاده کنید.
-# Render به‌طور خودکار RENDER_EXTERNAL_URL را تنظیم می‌کند (پیکربندی صفر).
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL")
     or os.environ.get("RENDER_EXTERNAL_URL")
@@ -50,180 +63,369 @@ WEBHOOK_URL = (
 ).rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# محدودیت حجم آپلود برای ربات‌های تلگرام: ۵۰ مگابایت
+# سقف حجم آپلود ربات‌های تلگرام: ۵۰ مگابایت
 MAX_TELEGRAM_BYTES = 50 * 1024 * 1024
+# کیفیت‌هایی که به‌ترتیب امتحان می‌شوند تا فایل زیر ۵۰MB به‌دست آید
+HEIGHT_CAPS = [1080, 720, 480, 360, 240]
 
-# اطلاعات ورود اختیاری اینستاگرام برای کاهش خطای محدودیت (rate-limit).
-IG_USERNAME = os.environ.get("IG_USERNAME")
-IG_PASSWORD = os.environ.get("IG_PASSWORD")
+# مسیر اختیاری فایل کوکی برای محتوای محدودشده (اینستاگرام/فیسبوک)
+COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
-# الگوی استخراج کد کوتاه (shortcode) از لینک‌های اینستاگرام
-SHORTCODE_RE = re.compile(
-    r"(?:instagram\.com|instagr\.am)/(?:[^/]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)",
-    re.IGNORECASE,
-)
+# دامنه‌ها برای تشخیص خودکار سرویس از روی لینک
+PLATFORM_PATTERNS = {
+    "instagram": re.compile(r"instagram\.com|instagr\.am", re.I),
+    "facebook": re.compile(r"facebook\.com|fb\.watch|fb\.com", re.I),
+    "youtube": re.compile(r"youtube\.com|youtu\.be", re.I),
+}
+URL_RE = re.compile(r"https?://\S+", re.I)
 
-# ---------------------------------------------------------------------------
-# نمونه‌ی Instaloader (یک بار ساخته می‌شود)
-# ---------------------------------------------------------------------------
-L = instaloader.Instaloader(
-    dirname_pattern="{target}",
-    save_metadata=False,
-    download_comments=False,
-    download_geotags=False,
-    compress_json=False,
-    post_metadata_txt_pattern="",
-    quiet=True,
-)
-
-
-def _try_login() -> None:
-    """ورود اختیاری به اینستاگرام برای کاهش محدودیت‌ها."""
-    if not (IG_USERNAME and IG_PASSWORD):
-        return
-    session_path = f"/tmp/ig_session_{IG_USERNAME}"
-    try:
-        L.load_session_from_file(IG_USERNAME, session_path)
-        logger.info("نشست اینستاگرام از فایل بارگذاری شد.")
-        return
-    except FileNotFoundError:
-        pass
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("بارگذاری نشست ناموفق بود: %s", exc)
-    try:
-        L.login(IG_USERNAME, IG_PASSWORD)
-        L.save_session_to_file(session_path)
-        logger.info("ورود به اینستاگرام موفق بود.")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("ورود به اینستاگرام ناموفق بود (ادامه بدون ورود): %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# منطق دانلود
-# ---------------------------------------------------------------------------
-def extract_shortcode(text: str):
-    match = SHORTCODE_RE.search(text)
-    return match.group(1) if match else None
-
-
-def download_post(shortcode: str, dest_dir: str):
-    """پست را در dest_dir دانلود کرده و لیست فایل‌های مدیا را برمی‌گرداند.
-
-    این تابع همگام (blocking) است و باید در executor اجرا شود.
-    """
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    L.download_post(post, target=dest_dir)
-
-    media = []
-    for root, _dirs, filenames in os.walk(dest_dir):
-        for name in sorted(filenames):
-            if name.lower().endswith((".mp4", ".jpg", ".jpeg", ".png")):
-                media.append(os.path.join(root, name))
-    return media
-
-
-# ---------------------------------------------------------------------------
-# هندلرهای تلگرام
-# ---------------------------------------------------------------------------
 WELCOME = (
     "👋 سلام!\n\n"
-    "من یک ربات دانلود اینستاگرام هستم.\n"
-    "کافیست لینک یک *پست*، *ریلز* یا *IGTV* را برایم بفرستید تا برایتان دانلود کنم.\n\n"
-    "⚠️ توجه: فقط پست‌های عمومی (public) قابل دانلود هستند."
+    "به ربات دانلود و موسیقی خوش آمدید.\n"
+    "یکی از سرویس‌های زیر را انتخاب کنید 👇"
 )
 
-HELP = (
-    "📖 راهنما:\n\n"
-    "۱. لینک پست یا ریلز اینستاگرام را کپی کنید.\n"
-    "۲. لینک را برای من ارسال کنید.\n"
-    "۳. چند لحظه صبر کنید تا فایل را برایتان بفرستم.\n\n"
-    "نمونه لینک:\n"
-    "`https://www.instagram.com/reel/XXXXXXXXX/`"
+MENU = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("📷 اینستاگرام", callback_data="mode:instagram"),
+            InlineKeyboardButton("📘 فیسبوک", callback_data="mode:facebook"),
+        ],
+        [
+            InlineKeyboardButton("▶️ یوتیوب", callback_data="mode:youtube"),
+            InlineKeyboardButton("🎵 موسیقی", callback_data="mode:music"),
+        ],
+    ]
 )
 
+PROMPTS = {
+    "instagram": "📷 لینک پست یا ریلز اینستاگرام را بفرستید.",
+    "facebook": "📘 لینک ویدیوی فیسبوک را بفرستید.",
+    "youtube": "▶️ لینک ویدیوی یوتیوب را بفرستید.",
+    "music": (
+        "🎵 حالت موسیقی:\n\n"
+        "• نام آهنگ یا خواننده را تایپ کنید تا پیدا و ارسال شود.\n"
+        "• یا یک پیام صوتی/ویدیو بفرستید تا آهنگش را تشخیص دهم."
+    ),
+}
 
+
+# ---------------------------------------------------------------------------
+# توابع کمکی (blocking) — در executor اجرا می‌شوند
+# ---------------------------------------------------------------------------
+def _base_ydl_opts(dest_dir: str) -> dict:
+    opts = {
+        "outtmpl": os.path.join(dest_dir, "%(id)s.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "restrictfilenames": True,
+    }
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def download_video(url: str, dest_dir: str):
+    """ویدیو/عکس را دانلود کرده و مسیر فایل را برمی‌گرداند (زیر ۵۰MB)."""
+    last_path = None
+    for cap in HEIGHT_CAPS:
+        # پاک کردن باقی‌مانده‌ی تلاش قبلی
+        for f in os.listdir(dest_dir):
+            try:
+                os.remove(os.path.join(dest_dir, f))
+            except OSError:
+                pass
+
+        fmt = (
+            f"bv*[height<={cap}][ext=mp4]+ba[ext=m4a]/"
+            f"b[height<={cap}][ext=mp4]/"
+            f"b[height<={cap}]/b"
+        )
+        opts = _base_ydl_opts(dest_dir)
+        opts["format"] = fmt
+        opts["merge_output_format"] = "mp4"
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("تلاش دانلود (cap=%s) ناموفق: %s", cap, exc)
+            continue
+
+        files = [
+            os.path.join(dest_dir, f)
+            for f in os.listdir(dest_dir)
+            if f.lower().endswith((".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png"))
+        ]
+        if not files:
+            continue
+        last_path = max(files, key=os.path.getsize)
+        if os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES:
+            return last_path
+        # عکس‌ها معمولاً کوچک‌اند؛ اگر عکس بود همان را برگردان
+        if last_path.lower().endswith((".jpg", ".jpeg", ".png")):
+            return last_path
+
+    # هیچ نسخه‌ی زیر ۵۰MB پیدا نشد
+    if last_path and last_path.lower().endswith((".jpg", ".jpeg", ".png")):
+        return last_path
+    return None
+
+
+def download_audio_by_query(query: str, dest_dir: str):
+    """آهنگ را بر اساس نام جستجو و به‌صورت MP3 دانلود می‌کند.
+
+    خروجی: (مسیر فایل, عنوان, خواننده) یا None.
+    """
+    opts = _base_ydl_opts(dest_dir)
+    opts["format"] = "bestaudio/best"
+    opts["postprocessors"] = [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }
+    ]
+    # اگر لینک نبود، در یوتیوب جستجو کن
+    target = query if URL_RE.search(query) else f"ytsearch1:{query}"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("دانلود موسیقی ناموفق: %s", exc)
+        return None
+
+    if "entries" in info:
+        info = info["entries"][0] if info["entries"] else None
+    if not info:
+        return None
+
+    mp3s = [
+        os.path.join(dest_dir, f)
+        for f in os.listdir(dest_dir)
+        if f.lower().endswith(".mp3")
+    ]
+    if not mp3s:
+        return None
+    path = mp3s[0]
+    if os.path.getsize(path) > MAX_TELEGRAM_BYTES:
+        return None
+    title = info.get("track") or info.get("title") or "Unknown"
+    artist = info.get("artist") or info.get("uploader") or ""
+    return path, title, artist
+
+
+async def recognize_song(audio_path: str):
+    """آهنگ را از روی فایل صوتی تشخیص می‌دهد. خروجی: (عنوان, خواننده) یا None."""
+    if not _SHAZAM_AVAILABLE:
+        return None
+    try:
+        shazam = Shazam()
+        out = await shazam.recognize(audio_path)
+        track = out.get("track")
+        if not track:
+            return None
+        return track.get("title", ""), track.get("subtitle", "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("تشخیص آهنگ ناموفق: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ارسال فایل به تلگرام
+# ---------------------------------------------------------------------------
+async def _send_media_file(context, chat_id, path):
+    lower = path.lower()
+    if lower.endswith((".jpg", ".jpeg", ".png")):
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+        with open(path, "rb") as fh:
+            await context.bot.send_photo(chat_id, photo=fh)
+    elif lower.endswith(".mp3"):
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
+        with open(path, "rb") as fh:
+            await context.bot.send_audio(chat_id, audio=fh)
+    else:
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        with open(path, "rb") as fh:
+            await context.bot.send_video(chat_id, video=fh, supports_streaming=True)
+
+
+# ---------------------------------------------------------------------------
+# هندلرها
+# ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME, parse_mode="Markdown")
+    context.user_data.pop("mode", None)
+    await update.message.reply_text(WELCOME, reply_markup=MENU)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP, parse_mode="Markdown")
+    await update.message.reply_text(
+        "برای شروع /start را بزنید و یک سرویس انتخاب کنید.\n"
+        "یا مستقیم لینک اینستاگرام/فیسبوک/یوتیوب را بفرستید تا خودکار تشخیص دهم."
+    )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    context.user_data["mode"] = mode
+    await query.edit_message_text(PROMPTS.get(mode, "لینک را بفرستید."))
+
+
+def detect_platform(text: str):
+    for name, pat in PLATFORM_PATTERNS.items():
+        if pat.search(text):
+            return name
+    return None
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    shortcode = extract_shortcode(text)
+    mode = context.user_data.get("mode")
+    chat_id = update.effective_chat.id
 
-    if not shortcode:
+    url_match = URL_RE.search(text)
+    detected = detect_platform(text) if url_match else None
+
+    # حالت موسیقی + متن بدون لینک ⇒ جستجوی آهنگ
+    if mode == "music" and not url_match:
+        await _do_music_search(update, context, text)
+        return
+
+    # اگر لینک باشد (چه از منو، چه تشخیص خودکار) ⇒ دانلود ویدیو
+    if url_match:
+        await _do_video_download(update, context, url_match.group(0))
+        return
+
+    # نه لینک، نه حالت موسیقی
+    if mode in ("instagram", "facebook", "youtube"):
+        await update.message.reply_text("❌ لطفاً یک لینک معتبر بفرستید.")
+    else:
         await update.message.reply_text(
-            "❌ لینک اینستاگرام معتبر نیست.\n"
-            "لطفاً فقط لینک یک پست، ریلز یا IGTV بفرستید."
+            "لطفاً اول با /start یک سرویس انتخاب کنید یا یک لینک بفرستید.",
+            reply_markup=MENU,
+        )
+
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پیام صوتی/ویدیو ⇒ تشخیص آهنگ و ارسال MP3."""
+    chat_id = update.effective_chat.id
+    if not _SHAZAM_AVAILABLE:
+        await update.message.reply_text(
+            "❌ قابلیت تشخیص آهنگ روی این سرور فعال نیست."
         )
         return
 
-    status = await update.message.reply_text("⏳ در حال دانلود... کمی صبر کنید.")
-    chat_id = update.effective_chat.id
-
-    # هر درخواست در یک پوشه‌ی موقت جدا دانلود می‌شود و در پایان کاملاً حذف می‌گردد.
-    tmpdir = tempfile.mkdtemp(prefix="ig_")
+    status = await update.message.reply_text("🎧 در حال تشخیص آهنگ...")
+    tmpdir = tempfile.mkdtemp(prefix="rec_")
     try:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        tg_file = None
+        msg = update.message
+        if msg.voice:
+            tg_file = await msg.voice.get_file()
+        elif msg.audio:
+            tg_file = await msg.audio.get_file()
+        elif msg.video:
+            tg_file = await msg.video.get_file()
+        elif msg.video_note:
+            tg_file = await msg.video_note.get_file()
+
+        if tg_file is None:
+            await status.edit_text("❌ فایل صوتی پیدا نشد.")
+            return
+
+        src = os.path.join(tmpdir, "input")
+        await tg_file.download_to_drive(src)
+
+        result = await recognize_song(src)
+        if not result or not result[0]:
+            await status.edit_text("❌ نتوانستم آهنگ را تشخیص دهم. کلیپ واضح‌تری بفرستید.")
+            return
+
+        title, artist = result
+        await status.edit_text(f"🎵 پیدا شد:\n*{title}* — {artist}\n\n⏳ در حال ارسال...",
+                               parse_mode="Markdown")
 
         loop = asyncio.get_running_loop()
-        try:
-            media = await loop.run_in_executor(
-                None, download_post, shortcode, tmpdir
-            )
-        except instaloader.exceptions.InstaloaderException as exc:
-            logger.warning("خطای اینستالودر (%s): %s", shortcode, exc)
-            await status.edit_text(
-                "❌ نتوانستم این پست را دانلود کنم.\n"
-                "ممکن است خصوصی (private) باشد یا حذف شده باشد."
-            )
-            return
-
-        if not media:
-            await status.edit_text("❌ هیچ فایل قابل دانلودی در این پست پیدا نشد.")
-            return
-
-        sent = 0
-        for path in media:
-            size = os.path.getsize(path)
-            if size > MAX_TELEGRAM_BYTES:
-                await context.bot.send_message(
-                    chat_id,
-                    f"⚠️ یک فایل به دلیل حجم زیاد (بیش از ۵۰ مگابایت) ارسال نشد.",
-                )
-                continue
-
-            try:
-                if path.lower().endswith(".mp4"):
-                    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-                    with open(path, "rb") as fh:
-                        await context.bot.send_video(chat_id, video=fh)
-                else:
-                    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-                    with open(path, "rb") as fh:
-                        await context.bot.send_photo(chat_id, photo=fh)
-                sent += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.error("خطا در ارسال فایل %s: %s", path, exc)
-
-        if sent:
-            await status.edit_text(f"✅ انجام شد! ({sent} فایل ارسال شد)")
+        got = await loop.run_in_executor(
+            None, download_audio_by_query, f"{title} {artist}", tmpdir
+        )
+        if got:
+            path, _t, _a = got
+            await _send_media_file(context, chat_id, path)
+            await status.edit_text(f"✅ {title} — {artist}")
         else:
-            await status.edit_text("❌ ارسال فایل‌ها ناموفق بود.")
-
+            await status.edit_text(
+                f"🎵 آهنگ شناسایی شد:\n*{title}* — {artist}\n"
+                "ولی فایلش پیدا نشد.",
+                parse_mode="Markdown",
+            )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("خطای غیرمنتظره: %s", exc)
+        logger.exception("خطا در تشخیص: %s", exc)
         try:
-            await status.edit_text("❌ خطای غیرمنتظره‌ای رخ داد. دوباره تلاش کنید.")
+            await status.edit_text("❌ خطا در پردازش. دوباره تلاش کنید.")
         except Exception:  # noqa: BLE001
             pass
     finally:
-        # حذف کامل تمام فایل‌های دانلودشده تا حافظه‌ی هاست پر نشود.
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# منطق‌های مشترک
+# ---------------------------------------------------------------------------
+async def _do_video_download(update, context, url):
+    chat_id = update.effective_chat.id
+    status = await update.message.reply_text("⏳ در حال دانلود... کمی صبر کنید.")
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+        loop = asyncio.get_running_loop()
+        path = await loop.run_in_executor(None, download_video, url, tmpdir)
+        if not path:
+            await status.edit_text(
+                "❌ دانلود ناموفق بود.\n"
+                "شاید محتوا خصوصی باشد، یا حتی کم‌کیفیت‌ترین نسخه هم از ۵۰MB بزرگ‌تر است."
+            )
+            return
+        await _send_media_file(context, chat_id, path)
+        await status.edit_text("✅ انجام شد!")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("خطا در دانلود ویدیو: %s", exc)
+        try:
+            await status.edit_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         logger.info("پوشه‌ی موقت حذف شد: %s", tmpdir)
+
+
+async def _do_music_search(update, context, query):
+    chat_id = update.effective_chat.id
+    status = await update.message.reply_text(f"🔎 در حال جستجوی «{query}»...")
+    tmpdir = tempfile.mkdtemp(prefix="mus_")
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
+        loop = asyncio.get_running_loop()
+        got = await loop.run_in_executor(
+            None, download_audio_by_query, query, tmpdir
+        )
+        if not got:
+            await status.edit_text("❌ آهنگی پیدا نشد یا حجمش بیش از ۵۰MB بود.")
+            return
+        path, title, artist = got
+        await _send_media_file(context, chat_id, path)
+        await status.edit_text(f"✅ {title}" + (f" — {artist}" if artist else ""))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("خطا در جستجوی موسیقی: %s", exc)
+        try:
+            await status.edit_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -234,18 +436,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # اجرا
 # ---------------------------------------------------------------------------
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == _DEFAULT_TOKEN:
-        logger.warning(
-            "از توکن پیش‌فرض استفاده می‌شود! برای امنیت، متغیر محیطی BOT_TOKEN را "
-            "تنظیم کرده و توکن را از BotFather دوباره بسازید."
-        )
+    if not BOT_TOKEN:
+        raise SystemExit("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
 
-    _try_login()
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)  # پردازش همزمان برای کاربران زیاد
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
+    app.add_handler(
+        MessageHandler(
+            filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE,
+            handle_audio,
+        )
+    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
 
     if WEBHOOK_URL:
