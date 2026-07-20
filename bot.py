@@ -67,7 +67,7 @@ WEBHOOK_URL = (
     or ""
 ).rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
-MAX_TELEGRAM_BYTES = 50 * 1024 * 1024
+MAX_TELEGRAM_BYTES = 100 * 1024 * 1024
 HEIGHT_CAPS = [1080, 720, 480, 360, 240]
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
