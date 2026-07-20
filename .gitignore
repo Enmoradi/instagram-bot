@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.session
+ig_session_*
+.venv/
+venv/
+*.mp4
+*.jpg
+*.jpeg
+*.png

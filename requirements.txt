@@ -1,4 +1,2 @@
-python-telegram-bot==20.3
-nest_asyncio
-requests
-instaloader
+python-telegram-bot==20.7
+instaloader==4.15.2
