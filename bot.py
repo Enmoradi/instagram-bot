@@ -20,8 +20,10 @@ import os
 import re
 import shutil
 import tempfile
+import time
 
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -66,6 +68,44 @@ PORT = int(os.environ.get("PORT", "10000"))
 MAX_TELEGRAM_BYTES = 50 * 1024 * 1024
 HEIGHT_CAPS = [1080, 720, 480, 360, 240]
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
+
+# ---- ضداسپم و پایداری ----
+# حداکثر درخواست هر کاربر در هر دقیقه
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "15"))
+# حداکثر دانلودهای همزمان روی کل سرور (محافظت از منابع هاست رایگان)
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "4"))
+# تعداد تلاش مجدد روی خطای موقت شبکه
+DOWNLOAD_RETRIES = int(os.environ.get("DOWNLOAD_RETRIES", "2"))
+
+_download_sem = asyncio.Semaphore(MAX_CONCURRENT)
+_user_hits = {}   # uid -> [timestamps]
+_user_busy = set()  # کاربرانی که همین الان یک درخواست در حال پردازش دارند
+
+
+def _rate_limited(uid):
+    now = time.time()
+    hits = [t for t in _user_hits.get(uid, []) if now - t < 60]
+    hits.append(now)
+    _user_hits[uid] = hits
+    return len(hits) > RATE_LIMIT_PER_MIN
+
+
+async def _acquire_job(update, uid):
+    """کنترل نرخ و جلوگیری از درخواست همزمان. True یعنی مجاز است."""
+    if is_admin(uid):
+        pass  # ادمین‌ها محدود نمی‌شوند
+    elif _rate_limited(uid):
+        await update.effective_message.reply_text(
+            "⏳ تعداد درخواست‌های شما زیاد است. لطفاً یک دقیقه صبر کنید."
+        )
+        return False
+    if uid in _user_busy:
+        await update.effective_message.reply_text(
+            "⏳ درخواست قبلی شما هنوز در حال پردازش است؛ کمی صبر کنید."
+        )
+        return False
+    _user_busy.add(uid)
+    return True
 
 # محل ذخیره‌ی تنظیمات و لیست کاربران. روی هاست‌های با دیسک دائمی، DATA_DIR را
 # به آن مسیر تنظیم کنید تا تنظیمات بعد از ری‌دیپلوی هم بماند.
@@ -212,6 +252,28 @@ def main_menu():
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+def _back_menu_kb():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu")]]
+    )
+
+
+def _prompt_kb():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ بازگشت", callback_data="menu")]]
+    )
+
+
+def _build_caption(title, source):
+    parts = []
+    if title:
+        parts.append(f"🎬 {title.strip()}")
+    if source:
+        parts.append(f"📍 {source.strip()}")
+    caption = "\n".join(parts)
+    return caption[:1000] if caption else None
+
+
 # ---------------------------------------------------------------------------
 # دانلود (blocking) — در executor اجرا می‌شوند
 # ---------------------------------------------------------------------------
@@ -229,7 +291,9 @@ def _base_ydl_opts(dest_dir):
 
 
 def download_video(url, dest_dir):
+    """خروجی: (مسیر, عنوان, منبع) زیر ۵۰MB، یا None."""
     last_path = None
+    last_info = {}
     for cap in HEIGHT_CAPS:
         for f in os.listdir(dest_dir):
             try:
@@ -243,12 +307,21 @@ def download_video(url, dest_dir):
         opts = _base_ydl_opts(dest_dir)
         opts["format"] = fmt
         opts["merge_output_format"] = "mp4"
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("دانلود (cap=%s) ناموفق: %s", cap, exc)
+
+        info = None
+        for attempt in range(1, DOWNLOAD_RETRIES + 1):
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("دانلود (cap=%s تلاش=%s) ناموفق: %s", cap, attempt, exc)
+                if attempt < DOWNLOAD_RETRIES:
+                    time.sleep(1.5)
+        if info is None:
             continue
+
+        last_info = info if isinstance(info, dict) else {}
         files = [
             os.path.join(dest_dir, f)
             for f in os.listdir(dest_dir)
@@ -257,12 +330,14 @@ def download_video(url, dest_dir):
         if not files:
             continue
         last_path = max(files, key=os.path.getsize)
-        if os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES:
-            return last_path
-        if last_path.lower().endswith((".jpg", ".jpeg", ".png")):
-            return last_path
+        if os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES or last_path.lower().endswith(
+            (".jpg", ".jpeg", ".png")
+        ):
+            title = last_info.get("title") or ""
+            source = last_info.get("uploader") or last_info.get("extractor_key") or ""
+            return last_path, title, source
     if last_path and last_path.lower().endswith((".jpg", ".jpeg", ".png")):
-        return last_path
+        return last_path, last_info.get("title", ""), last_info.get("uploader", "")
     return None
 
 
@@ -309,20 +384,22 @@ async def recognize_song(audio_path):
         return None
 
 
-async def _send_media_file(context, chat_id, path):
+async def _send_media_file(context, chat_id, path, caption=None):
     lower = path.lower()
     if lower.endswith((".jpg", ".jpeg", ".png")):
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
         with open(path, "rb") as fh:
-            await context.bot.send_photo(chat_id, photo=fh)
+            await context.bot.send_photo(chat_id, photo=fh, caption=caption)
     elif lower.endswith(".mp3"):
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         with open(path, "rb") as fh:
-            await context.bot.send_audio(chat_id, audio=fh)
+            await context.bot.send_audio(chat_id, audio=fh, caption=caption)
     else:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
         with open(path, "rb") as fh:
-            await context.bot.send_video(chat_id, video=fh, supports_streaming=True)
+            await context.bot.send_video(
+                chat_id, video=fh, caption=caption, supports_streaming=True
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +500,15 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     context.user_data["mode"] = mode
-    await query.edit_message_text(PROMPTS.get(mode, "لینک را بفرستید."))
+    await query.edit_message_text(PROMPTS.get(mode, "لینک را بفرستید."),
+                                  reply_markup=_prompt_kb())
+
+
+async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("mode", None)
+    await query.edit_message_text("یک سرویس انتخاب کنید 👇", reply_markup=main_menu())
 
 
 def detect_platform(text):
@@ -493,42 +578,51 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _SHAZAM_AVAILABLE:
         await update.message.reply_text("❌ قابلیت تشخیص آهنگ روی این سرور فعال نیست.")
         return
+    if not await _acquire_job(update, uid):
+        return
 
     chat_id = update.effective_chat.id
     status = await update.message.reply_text("🎧 در حال تشخیص آهنگ...")
     tmpdir = tempfile.mkdtemp(prefix="rec_")
     try:
-        msg = update.message
-        tg_file = None
-        for attr in ("voice", "audio", "video", "video_note"):
-            media = getattr(msg, attr, None)
-            if media:
-                tg_file = await media.get_file()
-                break
-        if tg_file is None:
-            await status.edit_text("❌ فایل صوتی پیدا نشد.")
-            return
-        src = os.path.join(tmpdir, "input")
-        await tg_file.download_to_drive(src)
+        async with _download_sem:
+            msg = update.message
+            tg_file = None
+            for attr in ("voice", "audio", "video", "video_note"):
+                media = getattr(msg, attr, None)
+                if media:
+                    tg_file = await media.get_file()
+                    break
+            if tg_file is None:
+                await status.edit_text("❌ فایل صوتی پیدا نشد.")
+                return
+            src = os.path.join(tmpdir, "input")
+            await tg_file.download_to_drive(src)
 
-        result = await recognize_song(src)
-        if not result or not result[0]:
-            await status.edit_text("❌ آهنگ تشخیص داده نشد. کلیپ واضح‌تری بفرستید.")
-            return
-        title, artist = result
-        await status.edit_text(f"🎵 پیدا شد:\n*{title}* — {artist}\n\n⏳ در حال ارسال...",
-                               parse_mode="Markdown")
-        loop = asyncio.get_running_loop()
-        got = await loop.run_in_executor(
-            None, download_audio_by_query, f"{title} {artist}", tmpdir
-        )
+            result = await recognize_song(src)
+            if not result or not result[0]:
+                await status.edit_text(
+                    "❌ آهنگ تشخیص داده نشد. کلیپ واضح‌تری بفرستید.",
+                    reply_markup=_back_menu_kb(),
+                )
+                return
+            title, artist = result
+            await status.edit_text(
+                f"🎵 پیدا شد:\n*{title}* — {artist}\n\n⏳ در حال ارسال...",
+                parse_mode="Markdown",
+            )
+            loop = asyncio.get_running_loop()
+            got = await loop.run_in_executor(
+                None, download_audio_by_query, f"{title} {artist}", tmpdir
+            )
         if got:
-            await _send_media_file(context, chat_id, got[0])
-            await status.edit_text(f"✅ {title} — {artist}")
+            await _send_media_file(context, chat_id, got[0], _build_caption(title, artist))
+            await status.edit_text(f"✅ {title} — {artist}", reply_markup=_back_menu_kb())
         else:
             await status.edit_text(
                 f"🎵 شناسایی شد:\n*{title}* — {artist}\nولی فایلش پیدا نشد.",
                 parse_mode="Markdown",
+                reply_markup=_back_menu_kb(),
             )
     except Exception as exc:  # noqa: BLE001
         logger.exception("خطا در تشخیص: %s", exc)
@@ -538,23 +632,30 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        _user_busy.discard(uid)
 
 
 async def _do_video_download(update, context, url):
+    uid = update.effective_user.id
+    if not await _acquire_job(update, uid):
+        return
     chat_id = update.effective_chat.id
     status = await update.message.reply_text("⏳ در حال دانلود... کمی صبر کنید.")
     tmpdir = tempfile.mkdtemp(prefix="dl_")
     try:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
         loop = asyncio.get_running_loop()
-        path = await loop.run_in_executor(None, download_video, url, tmpdir)
-        if not path:
+        async with _download_sem:
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
+            result = await loop.run_in_executor(None, download_video, url, tmpdir)
+        if not result:
             await status.edit_text(
-                "❌ دانلود ناموفق بود.\nشاید محتوا خصوصی است یا حتی کم‌کیفیت‌ترین نسخه هم از ۵۰MB بزرگ‌تر است."
+                "❌ دانلود ناموفق بود.\nشاید محتوا خصوصی است یا حتی کم‌کیفیت‌ترین نسخه هم از ۵۰MB بزرگ‌تر است.",
+                reply_markup=_back_menu_kb(),
             )
             return
-        await _send_media_file(context, chat_id, path)
-        await status.edit_text("✅ انجام شد!")
+        path, title, source = result
+        await _send_media_file(context, chat_id, path, _build_caption(title, source))
+        await status.edit_text("✅ انجام شد!", reply_markup=_back_menu_kb())
     except Exception as exc:  # noqa: BLE001
         logger.exception("خطا در دانلود: %s", exc)
         try:
@@ -563,22 +664,33 @@ async def _do_video_download(update, context, url):
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        _user_busy.discard(uid)
 
 
 async def _do_music_search(update, context, query):
+    uid = update.effective_user.id
+    if not await _acquire_job(update, uid):
+        return
     chat_id = update.effective_chat.id
     status = await update.message.reply_text(f"🔎 در حال جستجوی «{query}»...")
     tmpdir = tempfile.mkdtemp(prefix="mus_")
     try:
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         loop = asyncio.get_running_loop()
-        got = await loop.run_in_executor(None, download_audio_by_query, query, tmpdir)
+        async with _download_sem:
+            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
+            got = await loop.run_in_executor(None, download_audio_by_query, query, tmpdir)
         if not got:
-            await status.edit_text("❌ آهنگی پیدا نشد یا حجمش بیش از ۵۰MB بود.")
+            await status.edit_text(
+                "❌ آهنگی پیدا نشد یا حجمش بیش از ۵۰MB بود.",
+                reply_markup=_back_menu_kb(),
+            )
             return
         path, title, artist = got
-        await _send_media_file(context, chat_id, path)
-        await status.edit_text(f"✅ {title}" + (f" — {artist}" if artist else ""))
+        await _send_media_file(context, chat_id, path, _build_caption(title, artist))
+        await status.edit_text(
+            f"✅ {title}" + (f" — {artist}" if artist else ""),
+            reply_markup=_back_menu_kb(),
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("خطا در جستجوی موسیقی: %s", exc)
         try:
@@ -587,6 +699,7 @@ async def _do_music_search(update, context, query):
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        _user_busy.discard(uid)
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +889,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # اجرا
 # ---------------------------------------------------------------------------
+async def _post_init(app):
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "شروع / منوی اصلی"),
+            BotCommand("help", "راهنما"),
+            BotCommand("id", "نمایش آی‌دی عددی من"),
+            BotCommand("admin", "پنل مدیریت (فقط ادمین)"),
+        ]
+    )
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
@@ -787,6 +911,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
@@ -795,6 +920,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(on_menu_back, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(on_checkjoin, pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(on_admin, pattern=r"^adm:"))
     app.add_handler(
