@@ -70,16 +70,31 @@ HEIGHT_CAPS = [1080, 720, 480, 360, 240]
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
 # ---- ضداسپم و پایداری ----
-# حداکثر درخواست هر کاربر در هر دقیقه
-RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "15"))
-# حداکثر دانلودهای همزمان روی کل سرور (محافظت از منابع هاست رایگان)
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "4"))
 # تعداد تلاش مجدد روی خطای موقت شبکه
 DOWNLOAD_RETRIES = int(os.environ.get("DOWNLOAD_RETRIES", "2"))
 
-_download_sem = asyncio.Semaphore(MAX_CONCURRENT)
 _user_hits = {}   # uid -> [timestamps]
 _user_busy = set()  # کاربرانی که همین الان یک درخواست در حال پردازش دارند
+
+
+class _DynamicLimiter:
+    """محدودکننده‌ی سراسریِ داینامیک؛ سقف را هر لحظه از تنظیمات می‌خواند،
+    پس ادمین می‌تواند آن را زنده از پنل تغییر دهد."""
+
+    def __init__(self):
+        self.active = 0
+
+    async def __aenter__(self):
+        while self.active >= max(1, int(_config.get("max_concurrent", 6))):
+            await asyncio.sleep(0.25)
+        self.active += 1
+        return self
+
+    async def __aexit__(self, *exc):
+        self.active = max(0, self.active - 1)
+
+
+_limiter = _DynamicLimiter()
 
 
 def _rate_limited(uid):
@@ -87,14 +102,15 @@ def _rate_limited(uid):
     hits = [t for t in _user_hits.get(uid, []) if now - t < 60]
     hits.append(now)
     _user_hits[uid] = hits
-    return len(hits) > RATE_LIMIT_PER_MIN
+    return len(hits) > max(1, int(_config.get("rate_per_min", 15)))
 
 
 async def _acquire_job(update, uid):
-    """کنترل نرخ و جلوگیری از درخواست همزمان. True یعنی مجاز است."""
-    if is_admin(uid):
-        pass  # ادمین‌ها محدود نمی‌شوند
-    elif _rate_limited(uid):
+    """کنترل محدودیت کاربر. اگر «محدودیت کاربران» خاموش باشد یا کاربر ادمین
+    باشد، هیچ محدودیتی اعمال نمی‌شود و ربات تا حداکثر توان کار می‌کند."""
+    if not _config.get("user_limits") or is_admin(uid):
+        return True
+    if _rate_limited(uid):
         await update.effective_message.reply_text(
             "⏳ تعداد درخواست‌های شما زیاد است. لطفاً یک دقیقه صبر کنید."
         )
@@ -142,6 +158,10 @@ DEFAULT_CONFIG = {
         "music": True,
     },
     "welcome": "به ربات دانلود و موسیقی خوش آمدید 🎉",
+    # محدودیت کاربران به‌صورت پیش‌فرض خاموش است؛ از پنل قابل روشن کردن.
+    "user_limits": os.environ.get("USER_LIMITS", "false").lower() == "true",
+    "rate_per_min": int(os.environ.get("RATE_LIMIT_PER_MIN", "15")),
+    "max_concurrent": int(os.environ.get("MAX_CONCURRENT", "6")),
 }
 
 # ---------------------------------------------------------------------------
@@ -585,7 +605,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("🎧 در حال تشخیص آهنگ...")
     tmpdir = tempfile.mkdtemp(prefix="rec_")
     try:
-        async with _download_sem:
+        async with _limiter:
             msg = update.message
             tg_file = None
             for attr in ("voice", "audio", "video", "video_note"):
@@ -644,7 +664,7 @@ async def _do_video_download(update, context, url):
     tmpdir = tempfile.mkdtemp(prefix="dl_")
     try:
         loop = asyncio.get_running_loop()
-        async with _download_sem:
+        async with _limiter:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
             result = await loop.run_in_executor(None, download_video, url, tmpdir)
         if not result:
@@ -676,7 +696,7 @@ async def _do_music_search(update, context, query):
     tmpdir = tempfile.mkdtemp(prefix="mus_")
     try:
         loop = asyncio.get_running_loop()
-        async with _download_sem:
+        async with _limiter:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
             got = await loop.run_in_executor(None, download_audio_by_query, query, tmpdir)
         if not got:
@@ -705,19 +725,62 @@ async def _do_music_search(update, context, query):
 # ---------------------------------------------------------------------------
 # پنل مدیریت
 # ---------------------------------------------------------------------------
+PANEL_TITLE = "🛠 *پنل مدیریت*\nهمه‌ی تنظیمات زنده اعمال می‌شوند."
+LIMITS_TEXT = (
+    "⚙️ *محدودیت‌ها و کارایی*\n\n"
+    "👤 *محدودیت کاربران*: وقتی خاموش باشد، ربات بدون هیچ محدودیتی به همه‌ی "
+    "کاربران سرویس می‌دهد (پیش‌فرض). روشنش کنید تا نرخ درخواست هر کاربر کنترل شود.\n\n"
+    "📥 *دانلود همزمان*: سقف کل سرور. بالاتر = سریع‌تر برای همه، ولی مصرف منابع "
+    "بیشتر (اگر هاست ضعیف است زیاد بالا نبرید)."
+)
+
+
+def _onoff(b):
+    return "🟢" if b else "🔴"
+
+
 def admin_panel():
     c = _config
-    onoff = lambda b: "🟢" if b else "🔴"  # noqa: E731
     rows = [
-        [InlineKeyboardButton("📊 آمار", callback_data="adm:stats")],
-        [InlineKeyboardButton(
-            f"{onoff(c['force_join'])} قفل عضویت اجباری", callback_data="adm:toggle:force_join")],
-        [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="adm:channels")],
-        [InlineKeyboardButton("🧩 سرویس‌ها", callback_data="adm:services")],
-        [InlineKeyboardButton(
-            f"{onoff(c['maintenance'])} حالت تعمیر", callback_data="adm:toggle:maintenance")],
-        [InlineKeyboardButton("✉️ پیام همگانی", callback_data="adm:broadcast")],
-        [InlineKeyboardButton("✏️ پیام خوش‌آمد", callback_data="adm:welcome")],
+        [InlineKeyboardButton("📊 آمار و وضعیت", callback_data="adm:stats")],
+        [
+            InlineKeyboardButton(f"🔒 قفل عضویت {_onoff(c['force_join'])}",
+                                 callback_data="adm:toggle:force_join"),
+            InlineKeyboardButton("📢 کانال‌ها", callback_data="adm:channels"),
+        ],
+        [
+            InlineKeyboardButton("🧩 سرویس‌ها", callback_data="adm:services"),
+            InlineKeyboardButton("⚙️ محدودیت‌ها", callback_data="adm:limits"),
+        ],
+        [InlineKeyboardButton(f"🚧 حالت تعمیر {_onoff(c['maintenance'])}",
+                              callback_data="adm:toggle:maintenance")],
+        [
+            InlineKeyboardButton("✉️ پیام همگانی", callback_data="adm:broadcast"),
+            InlineKeyboardButton("✏️ خوش‌آمد", callback_data="adm:welcome"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def limits_panel():
+    c = _config
+    ul = "🟢 روشن" if c.get("user_limits") else "🔴 خاموش"
+    rows = [
+        [InlineKeyboardButton(f"👤 محدودیت کاربران: {ul}",
+                              callback_data="adm:toggle:user_limits")],
+        [
+            InlineKeyboardButton("➖", callback_data="adm:lim:rate:dec"),
+            InlineKeyboardButton(f"نرخ هر کاربر: {c.get('rate_per_min')}/دقیقه",
+                                 callback_data="adm:noop"),
+            InlineKeyboardButton("➕", callback_data="adm:lim:rate:inc"),
+        ],
+        [
+            InlineKeyboardButton("➖", callback_data="adm:lim:conc:dec"),
+            InlineKeyboardButton(f"دانلود همزمان: {c.get('max_concurrent')}",
+                                 callback_data="adm:noop"),
+            InlineKeyboardButton("➕", callback_data="adm:lim:conc:inc"),
+        ],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -753,7 +816,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
-    await update.message.reply_text("🛠 پنل مدیریت:", reply_markup=admin_panel())
+    await update.message.reply_text(PANEL_TITLE, parse_mode="Markdown",
+                                    reply_markup=admin_panel())
 
 
 async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -766,22 +830,29 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "home":
         await query.answer()
-        await query.edit_message_text("🛠 پنل مدیریت:", reply_markup=admin_panel())
+        await query.edit_message_text(PANEL_TITLE, parse_mode="Markdown",
+                                      reply_markup=admin_panel())
+
+    elif data == "noop":
+        await query.answer()
 
     elif data == "stats":
         await query.answer()
-        svc = _config["services"]
+        c = _config
+        svc = c["services"]
         txt = (
-            "📊 *آمار ربات*\n\n"
+            "📊 *آمار و وضعیت*\n\n"
             f"👥 کاربران: {len(_users)}\n"
-            f"🔒 قفل عضویت: {'روشن' if _config['force_join'] else 'خاموش'}\n"
-            f"📢 کانال‌ها: {', '.join(_config['channels']) or '—'}\n"
-            f"🚧 حالت تعمیر: {'روشن' if _config['maintenance'] else 'خاموش'}\n\n"
+            f"📥 دانلودهای فعال: {_limiter.active}\n\n"
+            f"🔒 قفل عضویت: {'روشن' if c['force_join'] else 'خاموش'}\n"
+            f"📢 کانال‌ها: {', '.join(c['channels']) or '—'}\n"
+            f"🚧 حالت تعمیر: {'روشن' if c['maintenance'] else 'خاموش'}\n"
+            f"👤 محدودیت کاربران: {'روشن' if c['user_limits'] else 'خاموش'} "
+            f"({c['rate_per_min']}/دقیقه)\n"
+            f"📥 سقف دانلود همزمان: {c['max_concurrent']}\n\n"
             "🧩 سرویس‌ها:\n"
-            f"  اینستاگرام: {'🟢' if svc['instagram'] else '🔴'}\n"
-            f"  فیسبوک: {'🟢' if svc['facebook'] else '🔴'}\n"
-            f"  یوتیوب: {'🟢' if svc['youtube'] else '🔴'}\n"
-            f"  موسیقی: {'🟢' if svc['music'] else '🔴'}\n"
+            f"  اینستاگرام {_onoff(svc['instagram'])}  فیسبوک {_onoff(svc['facebook'])}\n"
+            f"  یوتیوب {_onoff(svc['youtube'])}  موسیقی {_onoff(svc['music'])}\n"
         )
         await query.edit_message_text(
             txt, parse_mode="Markdown",
@@ -789,12 +860,35 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")]]),
         )
 
+    elif data == "limits":
+        await query.answer()
+        await query.edit_message_text(LIMITS_TEXT, parse_mode="Markdown",
+                                      reply_markup=limits_panel())
+
+    elif data.startswith("lim:"):
+        _, field, op = data.split(":")
+        if field == "rate":
+            step = 5 if op == "inc" else -5
+            _config["rate_per_min"] = max(1, int(_config.get("rate_per_min", 15)) + step)
+        else:  # conc
+            step = 1 if op == "inc" else -1
+            _config["max_concurrent"] = max(1, min(50, int(_config.get("max_concurrent", 6)) + step))
+        save_config()
+        await query.answer("تغییر کرد ✅")
+        await query.edit_message_text(LIMITS_TEXT, parse_mode="Markdown",
+                                      reply_markup=limits_panel())
+
     elif data.startswith("toggle:"):
         key = data.split(":", 1)[1]
         _config[key] = not _config.get(key, False)
         save_config()
         await query.answer("تغییر کرد ✅")
-        await query.edit_message_text("🛠 پنل مدیریت:", reply_markup=admin_panel())
+        if key == "user_limits":
+            await query.edit_message_text(LIMITS_TEXT, parse_mode="Markdown",
+                                          reply_markup=limits_panel())
+        else:
+            await query.edit_message_text(PANEL_TITLE, parse_mode="Markdown",
+                                          reply_markup=admin_panel())
 
     elif data == "services":
         await query.answer()
