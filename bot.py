@@ -741,34 +741,31 @@ def _onoff(b):
     return "🟢" if b else "🔴"
 
 
+def _state(b):
+    return "روشن ✅" if b else "خاموش ⛔️"
+
+
 def admin_panel():
     c = _config
     rows = [
-        [InlineKeyboardButton("📊 آمار و وضعیت", callback_data="adm:stats")],
-        [
-            InlineKeyboardButton(f"🔒 قفل عضویت {_onoff(c['force_join'])}",
-                                 callback_data="adm:toggle:force_join"),
-            InlineKeyboardButton("📢 کانال‌ها", callback_data="adm:channels"),
-        ],
-        [
-            InlineKeyboardButton("🧩 سرویس‌ها", callback_data="adm:services"),
-            InlineKeyboardButton("⚙️ محدودیت‌ها", callback_data="adm:limits"),
-        ],
-        [InlineKeyboardButton(f"🚧 حالت تعمیر {_onoff(c['maintenance'])}",
+        [InlineKeyboardButton("📊  آمار و وضعیت", callback_data="adm:stats")],
+        [InlineKeyboardButton("🧩  مدیریت سرویس‌ها", callback_data="adm:services")],
+        [InlineKeyboardButton(f"🔒  قفل عضویت اجباری — {_state(c['force_join'])}",
+                              callback_data="adm:toggle:force_join")],
+        [InlineKeyboardButton("📢  مدیریت کانال‌ها", callback_data="adm:channels")],
+        [InlineKeyboardButton("⚙️  محدودیت‌ها و کارایی", callback_data="adm:limits")],
+        [InlineKeyboardButton(f"🚧  حالت تعمیر — {_state(c['maintenance'])}",
                               callback_data="adm:toggle:maintenance")],
-        [
-            InlineKeyboardButton("✉️ پیام همگانی", callback_data="adm:broadcast"),
-            InlineKeyboardButton("✏️ خوش‌آمد", callback_data="adm:welcome"),
-        ],
+        [InlineKeyboardButton("✉️  ارسال پیام همگانی", callback_data="adm:broadcast")],
+        [InlineKeyboardButton("✏️  ویرایش پیام خوش‌آمد", callback_data="adm:welcome")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
 def limits_panel():
     c = _config
-    ul = "🟢 روشن" if c.get("user_limits") else "🔴 خاموش"
     rows = [
-        [InlineKeyboardButton(f"👤 محدودیت کاربران: {ul}",
+        [InlineKeyboardButton(f"👤  محدودیت کاربران — {_state(c.get('user_limits'))}",
                               callback_data="adm:toggle:user_limits")],
         [
             InlineKeyboardButton("➖", callback_data="adm:lim:rate:dec"),
@@ -782,7 +779,7 @@ def limits_panel():
                                  callback_data="adm:noop"),
             InlineKeyboardButton("➕", callback_data="adm:lim:conc:inc"),
         ],
-        [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")],
+        [InlineKeyboardButton("⬅️  بازگشت", callback_data="adm:home")],
     ]
     return InlineKeyboardMarkup(rows)
 
