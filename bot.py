@@ -1,19 +1,20 @@
 """
-ربات چندمنظوره‌ی دانلود و موسیقی برای تلگرام
+ربات چندمنظوره‌ی دانلود و موسیقی + پنل مدیریت کامل
 -------------------------------------------------
-سرویس‌ها (اول از منو انتخاب می‌شوند):
-  📷 اینستاگرام | 📘 فیسبوک | ▶️ یوتیوب | 🎵 موسیقی
+سرویس‌ها:  📷 اینستاگرام | 📘 فیسبوک | ▶️ یوتیوب | 🎵 موسیقی
 
 قابلیت‌ها:
-  - دانلود ویدیو/عکس از اینستاگرام، فیسبوک و یوتیوب (با yt-dlp)
-  - انتخاب خودکار بهترین کیفیت زیر ۵۰ مگابایت (سقف ربات‌های تلگرام)
-  - موسیقی: جستجو با نام آهنگ  +  تشخیص آهنگ از روی کلیپ صوتی (Shazam)
-  - حذف کامل فایل‌ها بلافاصله بعد از ارسال (مصرف حافظه ≈ صفر)
-  - پردازش همزمان درخواست‌ها برای تعداد کاربر بالا
-  - اجرا در دو حالت polling و webhook (هاست وب رایگان)
+  - دانلود ویدیو/عکس از اینستاگرام، فیسبوک، یوتیوب (yt-dlp)
+  - انتخاب خودکار بهترین کیفیت زیر ۵۰ مگابایت
+  - موسیقی: جستجو با نام + تشخیص آهنگ از روی کلیپ (Shazam)
+  - حذف کامل فایل‌ها بعد از ارسال (مصرف حافظه ≈ صفر)
+  - پردازش همزمان برای تعداد کاربر بالا
+  - پنل مدیریت داینامیک: قفل عضویت اجباری، فعال/غیرفعال کردن سرویس‌ها،
+    حالت تعمیر، پیام همگانی، آمار، پیام خوش‌آمد
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -37,7 +39,6 @@ from telegram.ext import (
 
 import yt_dlp
 
-# تشخیص آهنگ اختیاری است؛ اگر کتابخانه نصب نبود، ربات بدون این قابلیت کار می‌کند.
 try:
     from shazamio import Shazam  # type: ignore
 
@@ -46,7 +47,7 @@ except Exception:  # noqa: BLE001
     _SHAZAM_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
-# پیکربندی
+# پیکربندی پایه (از متغیر محیطی)
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -62,16 +63,116 @@ WEBHOOK_URL = (
     or ""
 ).rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
-
-# سقف حجم آپلود ربات‌های تلگرام: ۵۰ مگابایت
 MAX_TELEGRAM_BYTES = 50 * 1024 * 1024
-# کیفیت‌هایی که به‌ترتیب امتحان می‌شوند تا فایل زیر ۵۰MB به‌دست آید
 HEIGHT_CAPS = [1080, 720, 480, 360, 240]
-
-# مسیر اختیاری فایل کوکی برای محتوای محدودشده (اینستاگرام/فیسبوک)
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 
-# دامنه‌ها برای تشخیص خودکار سرویس از روی لینک
+# محل ذخیره‌ی تنظیمات و لیست کاربران. روی هاست‌های با دیسک دائمی، DATA_DIR را
+# به آن مسیر تنظیم کنید تا تنظیمات بعد از ری‌دیپلوی هم بماند.
+DATA_DIR = os.environ.get("DATA_DIR", "data")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+USERS_PATH = os.path.join(DATA_DIR, "users.json")
+
+
+def _parse_admins(raw: str):
+    ids = set()
+    for part in re.split(r"[,\s]+", raw or ""):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+# ادمین‌ها از متغیر محیطی (پایدار حتی بعد از ری‌دیپلوی)
+ADMIN_IDS = _parse_admins(os.environ.get("ADMIN_IDS", ""))
+
+# مقادیر پیش‌فرض تنظیمات؛ برخی از env مقداردهی اولیه می‌شوند
+DEFAULT_CONFIG = {
+    "maintenance": False,
+    "force_join": os.environ.get("FORCE_JOIN", "false").lower() == "true",
+    "channels": [
+        c.strip()
+        for c in re.split(r"[,\s]+", os.environ.get("REQUIRED_CHANNELS", ""))
+        if c.strip()
+    ],
+    "services": {
+        "instagram": True,
+        "facebook": True,
+        "youtube": True,
+        "music": True,
+    },
+    "welcome": "به ربات دانلود و موسیقی خوش آمدید 🎉",
+}
+
+# ---------------------------------------------------------------------------
+# ذخیره‌سازی تنظیمات و کاربران
+# ---------------------------------------------------------------------------
+_config = dict(DEFAULT_CONFIG)
+_users = set()
+
+
+def _atomic_write(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_state():
+    global _config, _users
+    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(saved)
+        # اطمینان از وجود همه‌ی کلیدهای services
+        svc = dict(DEFAULT_CONFIG["services"])
+        svc.update(saved.get("services", {}))
+        merged["services"] = svc
+        _config = merged
+    except FileNotFoundError:
+        save_config()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("خواندن config ناموفق بود: %s", exc)
+
+    try:
+        with open(USERS_PATH, encoding="utf-8") as fh:
+            _users = set(json.load(fh))
+    except FileNotFoundError:
+        _users = set()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("خواندن users ناموفق بود: %s", exc)
+
+
+def save_config():
+    try:
+        _atomic_write(CONFIG_PATH, _config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ذخیره‌ی config ناموفق بود: %s", exc)
+
+
+def save_users():
+    try:
+        _atomic_write(USERS_PATH, sorted(_users))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ذخیره‌ی users ناموفق بود: %s", exc)
+
+
+def track_user(uid):
+    if uid not in _users:
+        _users.add(uid)
+        save_users()
+
+
+def is_admin(uid):
+    return uid in ADMIN_IDS
+
+
+# ---------------------------------------------------------------------------
+# سرویس‌ها و منو
+# ---------------------------------------------------------------------------
 PLATFORM_PATTERNS = {
     "instagram": re.compile(r"instagram\.com|instagr\.am", re.I),
     "facebook": re.compile(r"facebook\.com|fb\.watch|fb\.com", re.I),
@@ -79,24 +180,12 @@ PLATFORM_PATTERNS = {
 }
 URL_RE = re.compile(r"https?://\S+", re.I)
 
-WELCOME = (
-    "👋 سلام!\n\n"
-    "به ربات دانلود و موسیقی خوش آمدید.\n"
-    "یکی از سرویس‌های زیر را انتخاب کنید 👇"
-)
-
-MENU = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("📷 اینستاگرام", callback_data="mode:instagram"),
-            InlineKeyboardButton("📘 فیسبوک", callback_data="mode:facebook"),
-        ],
-        [
-            InlineKeyboardButton("▶️ یوتیوب", callback_data="mode:youtube"),
-            InlineKeyboardButton("🎵 موسیقی", callback_data="mode:music"),
-        ],
-    ]
-)
+SERVICE_LABELS = {
+    "instagram": "📷 اینستاگرام",
+    "facebook": "📘 فیسبوک",
+    "youtube": "▶️ یوتیوب",
+    "music": "🎵 موسیقی",
+}
 
 PROMPTS = {
     "instagram": "📷 لینک پست یا ریلز اینستاگرام را بفرستید.",
@@ -104,16 +193,29 @@ PROMPTS = {
     "youtube": "▶️ لینک ویدیوی یوتیوب را بفرستید.",
     "music": (
         "🎵 حالت موسیقی:\n\n"
-        "• نام آهنگ یا خواننده را تایپ کنید تا پیدا و ارسال شود.\n"
+        "• نام آهنگ یا خواننده را تایپ کنید.\n"
         "• یا یک پیام صوتی/ویدیو بفرستید تا آهنگش را تشخیص دهم."
     ),
 }
 
 
+def main_menu():
+    rows, row = [], []
+    for key in ("instagram", "facebook", "youtube", "music"):
+        if _config["services"].get(key, True):
+            row.append(InlineKeyboardButton(SERVICE_LABELS[key], callback_data=f"mode:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 # ---------------------------------------------------------------------------
-# توابع کمکی (blocking) — در executor اجرا می‌شوند
+# دانلود (blocking) — در executor اجرا می‌شوند
 # ---------------------------------------------------------------------------
-def _base_ydl_opts(dest_dir: str) -> dict:
+def _base_ydl_opts(dest_dir):
     opts = {
         "outtmpl": os.path.join(dest_dir, "%(id)s.%(ext)s"),
         "quiet": True,
@@ -126,33 +228,27 @@ def _base_ydl_opts(dest_dir: str) -> dict:
     return opts
 
 
-def download_video(url: str, dest_dir: str):
-    """ویدیو/عکس را دانلود کرده و مسیر فایل را برمی‌گرداند (زیر ۵۰MB)."""
+def download_video(url, dest_dir):
     last_path = None
     for cap in HEIGHT_CAPS:
-        # پاک کردن باقی‌مانده‌ی تلاش قبلی
         for f in os.listdir(dest_dir):
             try:
                 os.remove(os.path.join(dest_dir, f))
             except OSError:
                 pass
-
         fmt = (
             f"bv*[height<={cap}][ext=mp4]+ba[ext=m4a]/"
-            f"b[height<={cap}][ext=mp4]/"
-            f"b[height<={cap}]/b"
+            f"b[height<={cap}][ext=mp4]/b[height<={cap}]/b"
         )
         opts = _base_ydl_opts(dest_dir)
         opts["format"] = fmt
         opts["merge_output_format"] = "mp4"
-
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("تلاش دانلود (cap=%s) ناموفق: %s", cap, exc)
+            logger.warning("دانلود (cap=%s) ناموفق: %s", cap, exc)
             continue
-
         files = [
             os.path.join(dest_dir, f)
             for f in os.listdir(dest_dir)
@@ -163,31 +259,19 @@ def download_video(url: str, dest_dir: str):
         last_path = max(files, key=os.path.getsize)
         if os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES:
             return last_path
-        # عکس‌ها معمولاً کوچک‌اند؛ اگر عکس بود همان را برگردان
         if last_path.lower().endswith((".jpg", ".jpeg", ".png")):
             return last_path
-
-    # هیچ نسخه‌ی زیر ۵۰MB پیدا نشد
     if last_path and last_path.lower().endswith((".jpg", ".jpeg", ".png")):
         return last_path
     return None
 
 
-def download_audio_by_query(query: str, dest_dir: str):
-    """آهنگ را بر اساس نام جستجو و به‌صورت MP3 دانلود می‌کند.
-
-    خروجی: (مسیر فایل, عنوان, خواننده) یا None.
-    """
+def download_audio_by_query(query, dest_dir):
     opts = _base_ydl_opts(dest_dir)
     opts["format"] = "bestaudio/best"
     opts["postprocessors"] = [
-        {
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }
+        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
     ]
-    # اگر لینک نبود، در یوتیوب جستجو کن
     target = query if URL_RE.search(query) else f"ytsearch1:{query}"
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -195,34 +279,27 @@ def download_audio_by_query(query: str, dest_dir: str):
     except Exception as exc:  # noqa: BLE001
         logger.warning("دانلود موسیقی ناموفق: %s", exc)
         return None
-
     if "entries" in info:
         info = info["entries"][0] if info["entries"] else None
     if not info:
         return None
-
     mp3s = [
         os.path.join(dest_dir, f)
         for f in os.listdir(dest_dir)
         if f.lower().endswith(".mp3")
     ]
-    if not mp3s:
-        return None
-    path = mp3s[0]
-    if os.path.getsize(path) > MAX_TELEGRAM_BYTES:
+    if not mp3s or os.path.getsize(mp3s[0]) > MAX_TELEGRAM_BYTES:
         return None
     title = info.get("track") or info.get("title") or "Unknown"
     artist = info.get("artist") or info.get("uploader") or ""
-    return path, title, artist
+    return mp3s[0], title, artist
 
 
-async def recognize_song(audio_path: str):
-    """آهنگ را از روی فایل صوتی تشخیص می‌دهد. خروجی: (عنوان, خواننده) یا None."""
+async def recognize_song(audio_path):
     if not _SHAZAM_AVAILABLE:
         return None
     try:
-        shazam = Shazam()
-        out = await shazam.recognize(audio_path)
+        out = await Shazam().recognize(audio_path)
         track = out.get("track")
         if not track:
             return None
@@ -232,9 +309,6 @@ async def recognize_song(audio_path: str):
         return None
 
 
-# ---------------------------------------------------------------------------
-# ارسال فایل به تلگرام
-# ---------------------------------------------------------------------------
 async def _send_media_file(context, chat_id, path):
     lower = path.lower()
     if lower.endswith((".jpg", ".jpeg", ".png")):
@@ -252,112 +326,208 @@ async def _send_media_file(context, chat_id, path):
 
 
 # ---------------------------------------------------------------------------
-# هندلرها
+# قفل عضویت اجباری
+# ---------------------------------------------------------------------------
+async def is_member_all(context, uid):
+    """آیا کاربر عضو همه‌ی کانال‌های اجباری است؟ (خطا ⇒ عبور می‌دهیم)"""
+    for ch in _config.get("channels", []):
+        try:
+            member = await context.bot.get_chat_member(ch, uid)
+            if member.status in ("left", "kicked"):
+                return False
+        except TelegramError as exc:
+            logger.warning("بررسی عضویت %s ناموفق (ربات ادمین کانال هست؟): %s", ch, exc)
+            continue  # fail-open تا کاربران قفل نشوند
+    return True
+
+
+def _join_keyboard():
+    rows = []
+    for ch in _config.get("channels", []):
+        uname = ch.lstrip("@")
+        rows.append([InlineKeyboardButton(f"📢 عضویت در {ch}", url=f"https://t.me/{uname}")])
+    rows.append([InlineKeyboardButton("✅ عضو شدم", callback_data="checkjoin")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def require_membership(update, context, uid):
+    if not _config.get("force_join") or not _config.get("channels"):
+        return True
+    if is_admin(uid):
+        return True
+    if await is_member_all(context, uid):
+        return True
+    text = "🔒 برای استفاده از ربات، اول در کانال‌های زیر عضو شوید و بعد «✅ عضو شدم» را بزنید:"
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(text, reply_markup=_join_keyboard())
+    else:
+        await update.effective_message.reply_text(text, reply_markup=_join_keyboard())
+    return False
+
+
+async def on_checkjoin(update, context):
+    query = update.callback_query
+    uid = query.from_user.id
+    if await is_member_all(context, uid):
+        await query.answer("عضویت تأیید شد ✅")
+        await query.edit_message_text("✅ عضویت تأیید شد! حالا یک سرویس انتخاب کنید:",
+                                      reply_markup=main_menu())
+    else:
+        await query.answer("هنوز عضو همه‌ی کانال‌ها نیستید ❌", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# دستورهای عمومی
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    track_user(uid)
     context.user_data.pop("mode", None)
-    await update.message.reply_text(WELCOME, reply_markup=MENU)
+    context.user_data.pop("await", None)
+    if _config.get("maintenance") and not is_admin(uid):
+        await update.message.reply_text("🚧 ربات موقتاً در حال تعمیر است. کمی بعد امتحان کنید.")
+        return
+    if not await require_membership(update, context, uid):
+        return
+    await update.message.reply_text(
+        f"👋 {_config.get('welcome')}\n\nیک سرویس انتخاب کنید 👇",
+        reply_markup=main_menu(),
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "برای شروع /start را بزنید و یک سرویس انتخاب کنید.\n"
-        "یا مستقیم لینک اینستاگرام/فیسبوک/یوتیوب را بفرستید تا خودکار تشخیص دهم."
+        "برای شروع /start را بزنید و یک سرویس انتخاب کنید،\n"
+        "یا مستقیم لینک اینستاگرام/فیسبوک/یوتیوب را بفرستید."
     )
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🆔 آی‌دی عددی شما: `{update.effective_user.id}`",
+                                    parse_mode="Markdown")
 
 
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    uid = query.from_user.id
     mode = query.data.split(":", 1)[1]
+    if _config.get("maintenance") and not is_admin(uid):
+        await query.answer("🚧 ربات در حال تعمیر است.", show_alert=True)
+        return
+    if not _config["services"].get(mode, True):
+        await query.answer("این سرویس موقتاً غیرفعال است.", show_alert=True)
+        return
+    if not await require_membership(update, context, uid):
+        await query.answer()
+        return
+    await query.answer()
     context.user_data["mode"] = mode
     await query.edit_message_text(PROMPTS.get(mode, "لینک را بفرستید."))
 
 
-def detect_platform(text: str):
+def detect_platform(text):
     for name, pat in PLATFORM_PATTERNS.items():
         if pat.search(text):
             return name
     return None
 
 
+# ---------------------------------------------------------------------------
+# پیام‌های متنی و صوتی کاربر
+# ---------------------------------------------------------------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    track_user(uid)
     text = (update.message.text or "").strip()
-    mode = context.user_data.get("mode")
 
+    # حالت‌های ورودی ادمین (پیام همگانی، پیام خوش‌آمد، افزودن کانال)
+    if is_admin(uid) and context.user_data.get("await"):
+        await _handle_admin_input(update, context, text)
+        return
+
+    if _config.get("maintenance") and not is_admin(uid):
+        await update.message.reply_text("🚧 ربات موقتاً در حال تعمیر است.")
+        return
+    if not await require_membership(update, context, uid):
+        return
+
+    mode = context.user_data.get("mode")
     url_match = URL_RE.search(text)
 
-    # حالت موسیقی ⇒ همیشه خروجی صوتی (چه نام آهنگ، چه لینک)
     if mode == "music":
+        if not _config["services"].get("music", True):
+            await update.message.reply_text("این سرویس موقتاً غیرفعال است.")
+            return
         await _do_music_search(update, context, text)
         return
 
-    # اگر لینک باشد (چه از منو، چه تشخیص خودکار) ⇒ دانلود ویدیو
     if url_match:
+        platform = detect_platform(text) or mode
+        if platform in _config["services"] and not _config["services"][platform]:
+            await update.message.reply_text("این سرویس موقتاً غیرفعال است.")
+            return
         await _do_video_download(update, context, url_match.group(0))
         return
 
-    # نه لینک، نه حالت موسیقی
     if mode in ("instagram", "facebook", "youtube"):
         await update.message.reply_text("❌ لطفاً یک لینک معتبر بفرستید.")
     else:
         await update.message.reply_text(
             "لطفاً اول با /start یک سرویس انتخاب کنید یا یک لینک بفرستید.",
-            reply_markup=MENU,
+            reply_markup=main_menu(),
         )
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پیام صوتی/ویدیو ⇒ تشخیص آهنگ و ارسال MP3."""
-    chat_id = update.effective_chat.id
+    uid = update.effective_user.id
+    track_user(uid)
+    if _config.get("maintenance") and not is_admin(uid):
+        await update.message.reply_text("🚧 ربات موقتاً در حال تعمیر است.")
+        return
+    if not await require_membership(update, context, uid):
+        return
+    if not _config["services"].get("music", True):
+        await update.message.reply_text("سرویس موسیقی موقتاً غیرفعال است.")
+        return
     if not _SHAZAM_AVAILABLE:
-        await update.message.reply_text(
-            "❌ قابلیت تشخیص آهنگ روی این سرور فعال نیست."
-        )
+        await update.message.reply_text("❌ قابلیت تشخیص آهنگ روی این سرور فعال نیست.")
         return
 
+    chat_id = update.effective_chat.id
     status = await update.message.reply_text("🎧 در حال تشخیص آهنگ...")
     tmpdir = tempfile.mkdtemp(prefix="rec_")
     try:
-        tg_file = None
         msg = update.message
-        if msg.voice:
-            tg_file = await msg.voice.get_file()
-        elif msg.audio:
-            tg_file = await msg.audio.get_file()
-        elif msg.video:
-            tg_file = await msg.video.get_file()
-        elif msg.video_note:
-            tg_file = await msg.video_note.get_file()
-
+        tg_file = None
+        for attr in ("voice", "audio", "video", "video_note"):
+            media = getattr(msg, attr, None)
+            if media:
+                tg_file = await media.get_file()
+                break
         if tg_file is None:
             await status.edit_text("❌ فایل صوتی پیدا نشد.")
             return
-
         src = os.path.join(tmpdir, "input")
         await tg_file.download_to_drive(src)
 
         result = await recognize_song(src)
         if not result or not result[0]:
-            await status.edit_text("❌ نتوانستم آهنگ را تشخیص دهم. کلیپ واضح‌تری بفرستید.")
+            await status.edit_text("❌ آهنگ تشخیص داده نشد. کلیپ واضح‌تری بفرستید.")
             return
-
         title, artist = result
         await status.edit_text(f"🎵 پیدا شد:\n*{title}* — {artist}\n\n⏳ در حال ارسال...",
                                parse_mode="Markdown")
-
         loop = asyncio.get_running_loop()
         got = await loop.run_in_executor(
             None, download_audio_by_query, f"{title} {artist}", tmpdir
         )
         if got:
-            path, _t, _a = got
-            await _send_media_file(context, chat_id, path)
+            await _send_media_file(context, chat_id, got[0])
             await status.edit_text(f"✅ {title} — {artist}")
         else:
             await status.edit_text(
-                f"🎵 آهنگ شناسایی شد:\n*{title}* — {artist}\n"
-                "ولی فایلش پیدا نشد.",
+                f"🎵 شناسایی شد:\n*{title}* — {artist}\nولی فایلش پیدا نشد.",
                 parse_mode="Markdown",
             )
     except Exception as exc:  # noqa: BLE001
@@ -370,9 +540,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---------------------------------------------------------------------------
-# منطق‌های مشترک
-# ---------------------------------------------------------------------------
 async def _do_video_download(update, context, url):
     chat_id = update.effective_chat.id
     status = await update.message.reply_text("⏳ در حال دانلود... کمی صبر کنید.")
@@ -383,21 +550,19 @@ async def _do_video_download(update, context, url):
         path = await loop.run_in_executor(None, download_video, url, tmpdir)
         if not path:
             await status.edit_text(
-                "❌ دانلود ناموفق بود.\n"
-                "شاید محتوا خصوصی باشد، یا حتی کم‌کیفیت‌ترین نسخه هم از ۵۰MB بزرگ‌تر است."
+                "❌ دانلود ناموفق بود.\nشاید محتوا خصوصی است یا حتی کم‌کیفیت‌ترین نسخه هم از ۵۰MB بزرگ‌تر است."
             )
             return
         await _send_media_file(context, chat_id, path)
         await status.edit_text("✅ انجام شد!")
     except Exception as exc:  # noqa: BLE001
-        logger.exception("خطا در دانلود ویدیو: %s", exc)
+        logger.exception("خطا در دانلود: %s", exc)
         try:
             await status.edit_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
         except Exception:  # noqa: BLE001
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        logger.info("پوشه‌ی موقت حذف شد: %s", tmpdir)
 
 
 async def _do_music_search(update, context, query):
@@ -407,9 +572,7 @@ async def _do_music_search(update, context, query):
     try:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         loop = asyncio.get_running_loop()
-        got = await loop.run_in_executor(
-            None, download_audio_by_query, query, tmpdir
-        )
+        got = await loop.run_in_executor(None, download_audio_by_query, query, tmpdir)
         if not got:
             await status.edit_text("❌ آهنگی پیدا نشد یا حجمش بیش از ۵۰MB بود.")
             return
@@ -426,6 +589,186 @@ async def _do_music_search(update, context, query):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# پنل مدیریت
+# ---------------------------------------------------------------------------
+def admin_panel():
+    c = _config
+    onoff = lambda b: "🟢" if b else "🔴"  # noqa: E731
+    rows = [
+        [InlineKeyboardButton("📊 آمار", callback_data="adm:stats")],
+        [InlineKeyboardButton(
+            f"{onoff(c['force_join'])} قفل عضویت اجباری", callback_data="adm:toggle:force_join")],
+        [InlineKeyboardButton("📢 مدیریت کانال‌ها", callback_data="adm:channels")],
+        [InlineKeyboardButton("🧩 سرویس‌ها", callback_data="adm:services")],
+        [InlineKeyboardButton(
+            f"{onoff(c['maintenance'])} حالت تعمیر", callback_data="adm:toggle:maintenance")],
+        [InlineKeyboardButton("✉️ پیام همگانی", callback_data="adm:broadcast")],
+        [InlineKeyboardButton("✏️ پیام خوش‌آمد", callback_data="adm:welcome")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def services_panel():
+    onoff = lambda b: "🟢" if b else "🔴"  # noqa: E731
+    rows = [
+        [InlineKeyboardButton(
+            f"{onoff(_config['services'][k])} {SERVICE_LABELS[k]}",
+            callback_data=f"adm:svc:{k}")]
+        for k in ("instagram", "facebook", "youtube", "music")
+    ]
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def channels_panel():
+    rows = []
+    for ch in _config.get("channels", []):
+        rows.append([InlineKeyboardButton(f"❌ حذف {ch}", callback_data=f"adm:delch:{ch}")])
+    rows.append([InlineKeyboardButton("➕ افزودن کانال", callback_data="adm:addch")])
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text(
+            "⛔️ شما ادمین نیستید.\n"
+            f"آی‌دی عددی شما: `{uid}`\n"
+            "این آی‌دی را در متغیر محیطی ADMIN_IDS هاست بگذارید تا ادمین شوید.",
+            parse_mode="Markdown",
+        )
+        return
+    await update.message.reply_text("🛠 پنل مدیریت:", reply_markup=admin_panel())
+
+
+async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = query.from_user.id
+    if not is_admin(uid):
+        await query.answer("⛔️ دسترسی ندارید.", show_alert=True)
+        return
+    data = query.data[len("adm:"):]
+
+    if data == "home":
+        await query.answer()
+        await query.edit_message_text("🛠 پنل مدیریت:", reply_markup=admin_panel())
+
+    elif data == "stats":
+        await query.answer()
+        svc = _config["services"]
+        txt = (
+            "📊 *آمار ربات*\n\n"
+            f"👥 کاربران: {len(_users)}\n"
+            f"🔒 قفل عضویت: {'روشن' if _config['force_join'] else 'خاموش'}\n"
+            f"📢 کانال‌ها: {', '.join(_config['channels']) or '—'}\n"
+            f"🚧 حالت تعمیر: {'روشن' if _config['maintenance'] else 'خاموش'}\n\n"
+            "🧩 سرویس‌ها:\n"
+            f"  اینستاگرام: {'🟢' if svc['instagram'] else '🔴'}\n"
+            f"  فیسبوک: {'🟢' if svc['facebook'] else '🔴'}\n"
+            f"  یوتیوب: {'🟢' if svc['youtube'] else '🔴'}\n"
+            f"  موسیقی: {'🟢' if svc['music'] else '🔴'}\n"
+        )
+        await query.edit_message_text(
+            txt, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")]]),
+        )
+
+    elif data.startswith("toggle:"):
+        key = data.split(":", 1)[1]
+        _config[key] = not _config.get(key, False)
+        save_config()
+        await query.answer("تغییر کرد ✅")
+        await query.edit_message_text("🛠 پنل مدیریت:", reply_markup=admin_panel())
+
+    elif data == "services":
+        await query.answer()
+        await query.edit_message_text("🧩 روشن/خاموش کردن سرویس‌ها:", reply_markup=services_panel())
+
+    elif data.startswith("svc:"):
+        key = data.split(":", 1)[1]
+        _config["services"][key] = not _config["services"].get(key, True)
+        save_config()
+        await query.answer("تغییر کرد ✅")
+        await query.edit_message_text("🧩 روشن/خاموش کردن سرویس‌ها:", reply_markup=services_panel())
+
+    elif data == "channels":
+        await query.answer()
+        await query.edit_message_text(
+            "📢 کانال‌های عضویت اجباری:", reply_markup=channels_panel())
+
+    elif data == "addch":
+        await query.answer()
+        context.user_data["await"] = "addch"
+        await query.edit_message_text(
+            "یوزرنیم کانال را بفرستید (مثلاً `@mychannel`).\n"
+            "⚠️ ربات باید در آن کانال ادمین باشد تا بتواند عضویت را بررسی کند.",
+            parse_mode="Markdown",
+        )
+
+    elif data.startswith("delch:"):
+        ch = data.split(":", 1)[1]
+        if ch in _config["channels"]:
+            _config["channels"].remove(ch)
+            save_config()
+        await query.answer("حذف شد ✅")
+        await query.edit_message_text("📢 کانال‌های عضویت اجباری:", reply_markup=channels_panel())
+
+    elif data == "broadcast":
+        await query.answer()
+        context.user_data["await"] = "broadcast"
+        await query.edit_message_text(
+            "پیامی که می‌خواهید برای همه‌ی کاربران ارسال شود را بفرستید.\n"
+            "برای لغو /cancel را بزنید.")
+
+    elif data == "welcome":
+        await query.answer()
+        context.user_data["await"] = "welcome"
+        await query.edit_message_text(
+            "متن جدید پیام خوش‌آمد را بفرستید.\nبرای لغو /cancel را بزنید.")
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("await", None)
+    await update.message.reply_text("لغو شد.")
+
+
+async def _handle_admin_input(update, context, text):
+    mode = context.user_data.pop("await", None)
+    if mode == "welcome":
+        _config["welcome"] = text
+        save_config()
+        await update.message.reply_text("✅ پیام خوش‌آمد به‌روزرسانی شد.",
+                                        reply_markup=admin_panel())
+    elif mode == "addch":
+        ch = text.strip()
+        if not ch.startswith("@"):
+            ch = "@" + ch.lstrip("@")
+        if ch not in _config["channels"]:
+            _config["channels"].append(ch)
+            save_config()
+        await update.message.reply_text(f"✅ کانال {ch} اضافه شد.",
+                                        reply_markup=channels_panel())
+    elif mode == "broadcast":
+        await _broadcast(update, context, text)
+
+
+async def _broadcast(update, context, text):
+    total = len(_users)
+    status = await update.message.reply_text(f"📤 در حال ارسال به {total} کاربر...")
+    ok = fail = 0
+    for uid in list(_users):
+        try:
+            await context.bot.send_message(uid, text)
+            ok += 1
+        except Exception:  # noqa: BLE001
+            fail += 1
+        await asyncio.sleep(0.05)  # جلوگیری از محدودیت فلود تلگرام
+    await status.edit_text(f"✅ ارسال شد: {ok} موفق، {fail} ناموفق.")
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("خطا هنگام پردازش آپدیت:", exc_info=context.error)
 
@@ -437,15 +780,23 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
 
+    load_state()
+    logger.info("ادمین‌ها: %s | کاربران ذخیره‌شده: %d", ADMIN_IDS or "—", len(_users))
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)  # پردازش همزمان برای کاربران زیاد
+        .concurrent_updates(True)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("id", myid))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(on_checkjoin, pattern=r"^checkjoin$"))
+    app.add_handler(CallbackQueryHandler(on_admin, pattern=r"^adm:"))
     app.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE,

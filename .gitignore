@@ -5,6 +5,7 @@ __pycache__/
 ig_session_*
 .venv/
 venv/
+data/
 *.mp4
 *.jpg
 *.jpeg
