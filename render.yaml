@@ -9,6 +9,11 @@ services:
       # توکن را در داشبورد Render وارد کنید (Environment → Add Environment Variable)
       - key: BOT_TOKEN
         sync: false
+      # Cookie و Proxy فقط در داشبورد وارد می‌شوند و هرگز در Git ذخیره نمی‌شوند.
+      - key: INSTAGRAM_COOKIES_B64
+        sync: false
+      - key: PROXY_URLS
+        sync: false
       # آی‌دی عددی ادمین(ها) — صاحب ربات. برای چند ادمین با کاما جدا کنید.
       - key: ADMIN_IDS
         value: "8451818308"
