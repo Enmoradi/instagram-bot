@@ -449,7 +449,7 @@ def download_via_cobalt(url, dest_dir):
         f"{COBALT_API_URL}/",
         json=payload,
         headers=headers,
-        timeout=(20, 150),
+        timeout=(10, 70),
     )
     response.raise_for_status()
     data = response.json()
@@ -481,7 +481,7 @@ def download_via_cobalt(url, dest_dir):
         headers=download_headers,
         stream=True,
         allow_redirects=True,
-        timeout=(20, 180),
+        timeout=(10, 75),
     ) as media:
         media.raise_for_status()
         declared = int(media.headers.get("Content-Length") or 0)
@@ -884,15 +884,21 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not media:
             await status.edit_text("❌ فایل قابل پردازشی پیدا نشد.")
             return
-        tg_file = await media.get_file()
-        source = os.path.join(tmpdir, "sample")
-        await tg_file.download_to_drive(source)
-        loop = asyncio.get_running_loop()
-        async with _limiter:
-            prepared = await loop.run_in_executor(
-                None, prepare_recognition_sample, source, tmpdir
-            )
-            result = await recognize_song(prepared or source)
+        metadata_title = (msg.audio.title or "").strip() if msg.audio else ""
+        metadata_artist = (msg.audio.performer or "").strip() if msg.audio else ""
+        if metadata_title:
+            result = (metadata_title, metadata_artist)
+            logger.info("نام آهنگ از metadata تلگرام دریافت شد")
+        else:
+            tg_file = await media.get_file()
+            source = os.path.join(tmpdir, "sample")
+            await tg_file.download_to_drive(source)
+            loop = asyncio.get_running_loop()
+            async with _limiter:
+                prepared = await loop.run_in_executor(
+                    None, prepare_recognition_sample, source, tmpdir
+                )
+                result = await recognize_song(prepared or source)
         if result and result[0]:
             title, artist = result
             await status.edit_text(
@@ -967,6 +973,11 @@ async def _do_video_download(update, context, url):
                 return
 
             path, title, source = result
+            await status.edit_text("📤 دانلود کامل شد؛ در حال ارسال ویدیو...")
+            await _send_media_file(
+                context, chat_id, path, _build_caption(title, source)
+            )
+
             audio_path = None
             song = None
             full_song = None
@@ -980,9 +991,6 @@ async def _do_video_download(update, context, url):
                         full_song = await loop.run_in_executor(
                             None, download_full_song, song[0], song[1], tmpdir
                         )
-
-        await status.edit_text("📤 دانلود کامل شد؛ در حال ارسال ویدیو...")
-        await _send_media_file(context, chat_id, path, _build_caption(title, source))
 
         if full_song:
             song_path, found_title, found_artist = full_song
