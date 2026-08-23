@@ -230,8 +230,10 @@ def is_admin(uid):
 # سرویس‌ها و منو
 # ---------------------------------------------------------------------------
 PLATFORM_PATTERNS = {
-    "instagram": re.compile(r"(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:p|reel|reels|tv)/", re.I),
-    "facebook": re.compile(r"(?:www\\.|m\\.|web\\.)?(?:facebook\\.com|fb\\.watch|fb\\.com)/", re.I),
+    # تشخیص دامنه عمداً مسیر را محدود نمی‌کند؛ Instagram و Facebook
+    # شکل‌های متفاوتی برای reel/share/watch و پارامترهای اشتراک تولید می‌کنند.
+    "instagram": re.compile(r"(?:instagram\.com|instagr\.am)", re.I),
+    "facebook": re.compile(r"(?:facebook\.com|fb\.watch|fb\.com)", re.I),
 }
 URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
