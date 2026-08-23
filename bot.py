@@ -1,16 +1,8 @@
 """
-ربات چندمنظوره‌ی دانلود و موسیقی + پنل مدیریت کامل
--------------------------------------------------
-سرویس‌ها:  📷 اینستاگرام | 📘 فیسبوک | ▶️ یوتیوب | 🎵 موسیقی
+ربات حرفه‌ای دانلود و شناسایی موسیقی برای Instagram و Facebook.
 
-قابلیت‌ها:
-  - دانلود ویدیو/عکس از اینستاگرام، فیسبوک، یوتیوب (yt-dlp)
-  - انتخاب خودکار بهترین کیفیت زیر ۵۰ مگابایت
-  - موسیقی: جستجو با نام + تشخیص آهنگ از روی کلیپ (Shazam)
-  - حذف کامل فایل‌ها بعد از ارسال (مصرف حافظه ≈ صفر)
-  - پردازش همزمان برای تعداد کاربر بالا
-  - پنل مدیریت داینامیک: قفل عضویت اجباری، فعال/غیرفعال کردن سرویس‌ها،
-    حالت تعمیر، پیام همگانی، آمار، پیام خوش‌آمد
+هر لینک معتبر را دانلود می‌کند، ویدیو/عکس را می‌فرستد، صدای ویدیو را به MP3
+تبدیل می‌کند و با Shazam نام آهنگ و خواننده را تشخیص می‌دهد.
 """
 
 import asyncio
@@ -19,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 
@@ -156,8 +149,6 @@ DEFAULT_CONFIG = {
     "services": {
         "instagram": True,
         "facebook": True,
-        "youtube": True,
-        "music": True,
     },
     "welcome": "به ربات دانلود و موسیقی خوش آمدید 🎉",
     # محدودیت کاربران به‌صورت پیش‌فرض خاموش است؛ از پنل قابل روشن کردن.
@@ -190,9 +181,12 @@ def load_state():
         merged = dict(DEFAULT_CONFIG)
         merged.update(saved)
         # اطمینان از وجود همه‌ی کلیدهای services
-        svc = dict(DEFAULT_CONFIG["services"])
-        svc.update(saved.get("services", {}))
-        merged["services"] = svc
+        # فقط سرویس‌های پشتیبانی‌شده را از تنظیمات قدیمی نگه می‌داریم.
+        saved_services = saved.get("services", {})
+        merged["services"] = {
+            key: bool(saved_services.get(key, enabled))
+            for key, enabled in DEFAULT_CONFIG["services"].items()
+        }
         _config = merged
     except FileNotFoundError:
         save_config()
@@ -236,42 +230,30 @@ def is_admin(uid):
 # سرویس‌ها و منو
 # ---------------------------------------------------------------------------
 PLATFORM_PATTERNS = {
-    "instagram": re.compile(r"instagram\.com|instagr\.am", re.I),
-    "facebook": re.compile(r"facebook\.com|fb\.watch|fb\.com", re.I),
-    "youtube": re.compile(r"youtube\.com|youtu\.be", re.I),
+    "instagram": re.compile(r"(?:www\\.)?(?:instagram\\.com|instagr\\.am)/(?:p|reel|reels|tv)/", re.I),
+    "facebook": re.compile(r"(?:www\\.|m\\.|web\\.)?(?:facebook\\.com|fb\\.watch|fb\\.com)/", re.I),
 }
-URL_RE = re.compile(r"https?://\S+", re.I)
+URL_RE = re.compile(r"https?://[^\s<>]+", re.I)
 
 SERVICE_LABELS = {
     "instagram": "📷 اینستاگرام",
     "facebook": "📘 فیسبوک",
-    "youtube": "▶️ یوتیوب",
-    "music": "🎵 موسیقی",
 }
 
 PROMPTS = {
-    "instagram": "📷 لینک پست یا ریلز اینستاگرام را بفرستید.",
-    "facebook": "📘 لینک ویدیوی فیسبوک را بفرستید.",
-    "youtube": "▶️ لینک ویدیوی یوتیوب را بفرستید.",
-    "music": (
-        "🎵 حالت موسیقی:\n\n"
-        "• نام آهنگ یا خواننده را تایپ کنید.\n"
-        "• یا یک پیام صوتی/ویدیو بفرستید تا آهنگش را تشخیص دهم."
-    ),
+    "instagram": "📷 لینک پست، ریلز یا ویدیوی اینستاگرام را بفرستید.",
+    "facebook": "📘 لینک پست، ریلز یا ویدیوی فیسبوک را بفرستید.",
 }
 
 
 def main_menu():
-    rows, row = [], []
-    for key in ("instagram", "facebook", "youtube", "music"):
-        if _config["services"].get(key, True):
-            row.append(InlineKeyboardButton(SERVICE_LABELS[key], callback_data=f"mode:{key}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(rows) if rows else None
+    rows = [
+        [
+            InlineKeyboardButton(SERVICE_LABELS["instagram"], callback_data="mode:instagram"),
+            InlineKeyboardButton(SERVICE_LABELS["facebook"], callback_data="mode:facebook"),
+        ]
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _back_menu_kb():
@@ -313,7 +295,7 @@ def _base_ydl_opts(dest_dir):
 
 
 def download_video(url, dest_dir):
-    """خروجی: (مسیر, عنوان, منبع) زیر ۵۰MB، یا None."""
+    """خروجی: (مسیر، عنوان، منبع) زیر سقف ارسال تلگرام، یا None."""
     last_path = None
     last_info = {}
     for cap in HEIGHT_CAPS:
@@ -363,33 +345,27 @@ def download_video(url, dest_dir):
     return None
 
 
-def download_audio_by_query(query, dest_dir):
-    opts = _base_ydl_opts(dest_dir)
-    opts["format"] = "bestaudio/best"
-    opts["postprocessors"] = [
-        {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+def extract_audio_track(media_path, dest_dir):
+    """صدای ویدیو را به MP3 استاندارد تلگرام تبدیل می‌کند."""
+    output = os.path.join(dest_dir, "audio.mp3")
+    command = [
+        "ffmpeg", "-y", "-i", media_path, "-vn",
+        "-acodec", "libmp3lame", "-b:a", "192k", "-ar", "44100", output,
     ]
-    target = query if URL_RE.search(query) else f"ytsearch1:{query}"
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(target, download=True)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("دانلود موسیقی ناموفق: %s", exc)
+        completed = subprocess.run(
+            command, check=False, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, timeout=180,
+        )
+        if completed.returncode != 0 or not os.path.exists(output):
+            logger.warning("استخراج صدا ناموفق بود: %s", completed.stderr[-500:])
+            return None
+        if os.path.getsize(output) <= 0 or os.path.getsize(output) > MAX_TELEGRAM_BYTES:
+            return None
+        return output
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("خطا در FFmpeg: %s", exc)
         return None
-    if "entries" in info:
-        info = info["entries"][0] if info["entries"] else None
-    if not info:
-        return None
-    mp3s = [
-        os.path.join(dest_dir, f)
-        for f in os.listdir(dest_dir)
-        if f.lower().endswith(".mp3")
-    ]
-    if not mp3s or os.path.getsize(mp3s[0]) > MAX_TELEGRAM_BYTES:
-        return None
-    title = info.get("track") or info.get("title") or "Unknown"
-    artist = info.get("artist") or info.get("uploader") or ""
-    return mp3s[0], title, artist
 
 
 async def recognize_song(audio_path):
@@ -497,8 +473,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "برای شروع /start را بزنید و یک سرویس انتخاب کنید،\n"
-        "یا مستقیم لینک اینستاگرام/فیسبوک/یوتیوب را بفرستید."
+        "کافی است لینک عمومی اینستاگرام یا فیسبوک را بفرستید.\n"
+        "ربات ویدیو، فایل MP3 و نتیجه تشخیص آهنگ را برایتان ارسال می‌کند."
     )
 
 
@@ -562,13 +538,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.user_data.get("mode")
     url_match = URL_RE.search(text)
 
-    if mode == "music":
-        if not _config["services"].get("music", True):
-            await update.message.reply_text("این سرویس موقتاً غیرفعال است.")
-            return
-        await _do_music_search(update, context, text)
-        return
-
     if url_match:
         platform = detect_platform(text) or mode
         if platform in _config["services"] and not _config["services"][platform]:
@@ -577,7 +546,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _do_video_download(update, context, url_match.group(0))
         return
 
-    if mode in ("instagram", "facebook", "youtube"):
+    if mode in ("instagram", "facebook"):
         await update.message.reply_text("❌ لطفاً یک لینک معتبر بفرستید.")
     else:
         await update.message.reply_text(
@@ -587,6 +556,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تشخیص آهنگ از فایل صوتی/ویدیویی که کاربر مستقیماً می‌فرستد."""
     uid = update.effective_user.id
     track_user(uid)
     if _config.get("maintenance") and not is_admin(uid):
@@ -594,130 +564,121 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await require_membership(update, context, uid):
         return
-    if not _config["services"].get("music", True):
-        await update.message.reply_text("سرویس موسیقی موقتاً غیرفعال است.")
-        return
     if not _SHAZAM_AVAILABLE:
-        await update.message.reply_text("❌ قابلیت تشخیص آهنگ روی این سرور فعال نیست.")
+        await update.message.reply_text("❌ سرویس تشخیص آهنگ موقتاً در دسترس نیست.")
         return
     if not await _acquire_job(update, uid):
         return
 
-    chat_id = update.effective_chat.id
-    status = await update.message.reply_text("🎧 در حال تشخیص آهنگ...")
-    tmpdir = tempfile.mkdtemp(prefix="rec_")
+    status = await update.message.reply_text("🎧 در حال شنیدن و تشخیص آهنگ...")
+    tmpdir = tempfile.mkdtemp(prefix="recognize_")
     try:
+        msg = update.message
+        media = msg.voice or msg.audio or msg.video or msg.video_note
+        if not media:
+            await status.edit_text("❌ فایل قابل پردازشی پیدا نشد.")
+            return
+        tg_file = await media.get_file()
+        source = os.path.join(tmpdir, "sample")
+        await tg_file.download_to_drive(source)
         async with _limiter:
-            msg = update.message
-            tg_file = None
-            for attr in ("voice", "audio", "video", "video_note"):
-                media = getattr(msg, attr, None)
-                if media:
-                    tg_file = await media.get_file()
-                    break
-            if tg_file is None:
-                await status.edit_text("❌ فایل صوتی پیدا نشد.")
-                return
-            src = os.path.join(tmpdir, "input")
-            await tg_file.download_to_drive(src)
-
-            result = await recognize_song(src)
-            if not result or not result[0]:
-                await status.edit_text(
-                    "❌ آهنگ تشخیص داده نشد. کلیپ واضح‌تری بفرستید.",
-                    reply_markup=_back_menu_kb(),
-                )
-                return
+            result = await recognize_song(source)
+        if result and result[0]:
             title, artist = result
             await status.edit_text(
-                f"🎵 پیدا شد:\n*{title}* — {artist}\n\n⏳ در حال ارسال...",
-                parse_mode="Markdown",
-            )
-            loop = asyncio.get_running_loop()
-            got = await loop.run_in_executor(
-                None, download_audio_by_query, f"{title} {artist}", tmpdir
-            )
-        if got:
-            await _send_media_file(context, chat_id, got[0], _build_caption(title, artist))
-            await status.edit_text(f"✅ {title} — {artist}", reply_markup=_back_menu_kb())
-        else:
-            await status.edit_text(
-                f"🎵 شناسایی شد:\n*{title}* — {artist}\nولی فایلش پیدا نشد.",
-                parse_mode="Markdown",
+                f"🎵 آهنگ پیدا شد!\n\nعنوان: {title}\nخواننده: {artist or 'نامشخص'}",
                 reply_markup=_back_menu_kb(),
             )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("خطا در تشخیص: %s", exc)
-        try:
-            await status.edit_text("❌ خطا در پردازش. دوباره تلاش کنید.")
-        except Exception:  # noqa: BLE001
-            pass
+        else:
+            await status.edit_text(
+                "🔍 آهنگ تشخیص داده نشد. یک بخش واضح‌تر ۱۰ تا ۳۰ ثانیه‌ای بفرستید.",
+                reply_markup=_back_menu_kb(),
+            )
+    except Exception as exc:
+        logger.exception("خطا در تشخیص فایل کاربر: %s", exc)
+        await status.edit_text("❌ پردازش فایل ناموفق بود؛ دوباره تلاش کنید.")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         _user_busy.discard(uid)
 
 
 async def _do_video_download(update, context, url):
+    """دانلود رسانه، ارسال ویدیو، استخراج MP3 و تشخیص موسیقی در یک گردش کار."""
     uid = update.effective_user.id
+    platform = detect_platform(url)
+    if not platform:
+        await update.message.reply_text(
+            "❌ فقط لینک معتبر Instagram یا Facebook پذیرفته می‌شود.",
+            reply_markup=main_menu(),
+        )
+        return
+    if not _config["services"].get(platform, True):
+        await update.message.reply_text("این سرویس موقتاً غیرفعال است.")
+        return
     if not await _acquire_job(update, uid):
         return
+
     chat_id = update.effective_chat.id
-    status = await update.message.reply_text("⏳ در حال دانلود... کمی صبر کنید.")
-    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    status = await update.message.reply_text(
+        f"⏳ لینک {SERVICE_LABELS[platform]} دریافت شد؛ در حال آماده‌سازی رسانه..."
+    )
+    tmpdir = tempfile.mkdtemp(prefix=f"{platform}_")
     try:
         loop = asyncio.get_running_loop()
         async with _limiter:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
             result = await loop.run_in_executor(None, download_video, url, tmpdir)
-        if not result:
-            await status.edit_text(
-                "❌ دانلود ناموفق بود.\nشاید محتوا خصوصی است یا حتی کم‌کیفیت‌ترین نسخه هم از ۵۰MB بزرگ‌تر است.",
-                reply_markup=_back_menu_kb(),
-            )
-            return
-        path, title, source = result
+            if not result:
+                await status.edit_text(
+                    "❌ دانلود انجام نشد. محتوا باید عمومی و لینک آن معتبر باشد.",
+                    reply_markup=_back_menu_kb(),
+                )
+                return
+
+            path, title, source = result
+            audio_path = None
+            song = None
+            if path.lower().endswith((".mp4", ".mkv", ".webm")):
+                audio_path = await loop.run_in_executor(
+                    None, extract_audio_track, path, tmpdir
+                )
+                if audio_path:
+                    song = await recognize_song(audio_path)
+
+        await status.edit_text("📤 دانلود کامل شد؛ در حال ارسال ویدیو...")
         await _send_media_file(context, chat_id, path, _build_caption(title, source))
-        await status.edit_text("✅ انجام شد!", reply_markup=_back_menu_kb())
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("خطا در دانلود: %s", exc)
+
+        if audio_path:
+            audio_caption = "🎧 صدای استخراج‌شده از همین ویدیو"
+            if song and song[0]:
+                audio_caption += f"\n🎵 {song[0]}"
+                if song[1]:
+                    audio_caption += f" — {song[1]}"
+            await _send_media_file(context, chat_id, audio_path, audio_caption)
+
+        if song and song[0]:
+            final = (
+                "✅ ویدیو و موسیقی ارسال شد.\n\n"
+                f"🎵 آهنگ: {song[0]}\n"
+                f"🎤 خواننده: {song[1] or 'نامشخص'}"
+            )
+        elif audio_path:
+            final = (
+                "✅ ویدیو و فایل MP3 ارسال شد.\n"
+                "🔍 نام آهنگ از این بخش قابل تشخیص نبود."
+            )
+        else:
+            final = "✅ رسانه ارسال شد؛ این فایل صدای قابل استخراج نداشت."
+
+        await status.edit_text(final, reply_markup=_back_menu_kb())
+    except Exception as exc:
+        logger.exception("خطا در پردازش لینک %s: %s", platform, exc)
         try:
-            await status.edit_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
-        except Exception:  # noqa: BLE001
-            pass
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        _user_busy.discard(uid)
-
-
-async def _do_music_search(update, context, query):
-    uid = update.effective_user.id
-    if not await _acquire_job(update, uid):
-        return
-    chat_id = update.effective_chat.id
-    status = await update.message.reply_text(f"🔎 در حال جستجوی «{query}»...")
-    tmpdir = tempfile.mkdtemp(prefix="mus_")
-    try:
-        loop = asyncio.get_running_loop()
-        async with _limiter:
-            await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
-            got = await loop.run_in_executor(None, download_audio_by_query, query, tmpdir)
-        if not got:
             await status.edit_text(
-                "❌ آهنگی پیدا نشد یا حجمش بیش از ۵۰MB بود.",
+                "❌ پردازش ناموفق بود. چند لحظه بعد دوباره تلاش کنید.",
                 reply_markup=_back_menu_kb(),
             )
-            return
-        path, title, artist = got
-        await _send_media_file(context, chat_id, path, _build_caption(title, artist))
-        await status.edit_text(
-            f"✅ {title}" + (f" — {artist}" if artist else ""),
-            reply_markup=_back_menu_kb(),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("خطا در جستجوی موسیقی: %s", exc)
-        try:
-            await status.edit_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -790,7 +751,7 @@ def services_panel():
         [InlineKeyboardButton(
             f"{onoff(_config['services'][k])} {SERVICE_LABELS[k]}",
             callback_data=f"adm:svc:{k}")]
-        for k in ("instagram", "facebook", "youtube", "music")
+        for k in ("instagram", "facebook")
     ]
     rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")])
     return InlineKeyboardMarkup(rows)
@@ -851,7 +812,7 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📥 سقف دانلود همزمان: {c['max_concurrent']}\n\n"
             "🧩 سرویس‌ها:\n"
             f"  اینستاگرام {_onoff(svc['instagram'])}  فیسبوک {_onoff(svc['facebook'])}\n"
-            f"  یوتیوب {_onoff(svc['youtube'])}  موسیقی {_onoff(svc['music'])}\n"
+            "  🎵 استخراج و تشخیص موسیقی: خودکار برای هر ویدیو\n"
         )
         await query.edit_message_text(
             txt, parse_mode="Markdown",
