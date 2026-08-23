@@ -73,7 +73,12 @@ PROXY_URLS = [
     for value in re.split(r"[,\s]+", os.environ.get("PROXY_URLS", ""))
     if value.strip()
 ]
-COBALT_API_URL = os.environ.get("COBALT_API_URL", "").strip().rstrip("/")
+_configured_cobalt_url = os.environ.get("COBALT_API_URL", "").strip().rstrip("/")
+# مقدار قدیمی Blueprint به سرویس شکست‌خورده اشاره می‌کرد؛ سرویس تأییدشده را اجباری می‌کنیم.
+if not _configured_cobalt_url or "media-cobalt-fallback" in _configured_cobalt_url:
+    COBALT_API_URL = "https://media-cobalt-api-9rrt.onrender.com"
+else:
+    COBALT_API_URL = _configured_cobalt_url
 COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 BROWSER_USER_AGENT = os.environ.get(
     "BROWSER_USER_AGENT",
@@ -991,6 +996,12 @@ async def _do_video_download(update, context, url):
                     None, extract_audio_track, path, tmpdir
                 )
                 if audio_path:
+                    await _send_media_file(
+                        context,
+                        chat_id,
+                        audio_path,
+                        "🎧 صدای استخراج‌شده از همین ویدیو",
+                    )
                     song = await recognize_song(audio_path)
 
         if full_song:
@@ -1011,9 +1022,9 @@ async def _do_video_download(update, context, url):
                 "برای شنیدن نسخهٔ کامل یکی از سرویس‌های زیر را انتخاب کنید."
             )
         elif audio_path:
-            final = "✅ ویدیو ارسال شد؛ نام آهنگ از این بخش قابل تشخیص نبود."
+            final = "✅ ویدیو و فایل MP3 آن ارسال شد؛ نام آهنگ قابل تشخیص نبود."
         else:
-            final = "✅ رسانه ارسال شد؛ این فایل صدای قابل تشخیص نداشت."
+            final = "✅ رسانه ارسال شد؛ این فایل صدایی برای تبدیل به MP3 نداشت."
 
         await status.edit_text(
             final,
