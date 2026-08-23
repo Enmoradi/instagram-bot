@@ -181,9 +181,12 @@ def load_state():
         merged = dict(DEFAULT_CONFIG)
         merged.update(saved)
         # اطمینان از وجود همه‌ی کلیدهای services
-        svc = dict(DEFAULT_CONFIG["services"])
-        svc.update(saved.get("services", {}))
-        merged["services"] = svc
+        # فقط سرویس‌های پشتیبانی‌شده را از تنظیمات قدیمی نگه می‌داریم.
+        saved_services = saved.get("services", {})
+        merged["services"] = {
+            key: bool(saved_services.get(key, enabled))
+            for key, enabled in DEFAULT_CONFIG["services"].items()
+        }
         _config = merged
     except FileNotFoundError:
         save_config()
@@ -292,7 +295,7 @@ def _base_ydl_opts(dest_dir):
 
 
 def download_video(url, dest_dir):
-    """خروجی: (مسیر, عنوان, منبع) زیر ۵۰MB، یا None."""
+    """خروجی: (مسیر، عنوان، منبع) زیر سقف ارسال تلگرام، یا None."""
     last_path = None
     last_info = {}
     for cap in HEIGHT_CAPS:
