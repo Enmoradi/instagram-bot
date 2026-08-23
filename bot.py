@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from urllib.parse import quote_plus
 
 from telegram import (
     BotCommand,
@@ -310,6 +311,29 @@ def _back_menu_kb():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu")]]
     )
+
+
+def _music_search_kb(title, artist=""):
+    query = quote_plus(" ".join(x for x in (title, artist) if x).strip())
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "▶️ YouTube Music",
+                url=f"https://music.youtube.com/search?q={query}",
+            ),
+            InlineKeyboardButton(
+                "🟢 Spotify",
+                url=f"https://open.spotify.com/search/{query}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🟣 Deezer",
+                url=f"https://www.deezer.com/search/{query}",
+            ),
+            InlineKeyboardButton("🏠 منوی اصلی", callback_data="menu"),
+        ],
+    ])
 
 
 def _prompt_kb():
@@ -903,30 +927,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result and result[0]:
             title, artist = result
             await status.edit_text(
-                f"🎵 آهنگ پیدا شد!\n\nعنوان: {title}\nخواننده: {artist or 'نامشخص'}"
-                "\n\n⏳ در حال یافتن نسخه کامل..."
+                f"🎵 آهنگ شناسایی شد:\n{title} — {artist or 'نامشخص'}"
+                "\n\nبرای شنیدن نسخهٔ کامل یک سرویس را انتخاب کنید:",
+                reply_markup=_music_search_kb(title, artist),
             )
-            loop = asyncio.get_running_loop()
-            async with _limiter:
-                full_song = await loop.run_in_executor(
-                    None, download_full_song, title, artist, tmpdir
-                )
-            if full_song:
-                song_path, found_title, found_artist = full_song
-                caption = f"🎵 {title}"
-                if artist:
-                    caption += f" — {artist}"
-                await _send_media_file(context, update.effective_chat.id, song_path, caption)
-                await status.edit_text(
-                    "✅ نسخه کامل آهنگ ارسال شد.",
-                    reply_markup=_back_menu_kb(),
-                )
-            else:
-                await status.edit_text(
-                    f"🎵 آهنگ شناسایی شد:\n{title} — {artist or 'نامشخص'}"
-                    "\n\n❌ نسخه کامل قابل دریافت نبود.",
-                    reply_markup=_back_menu_kb(),
-                )
         else:
             await status.edit_text(
                 "🔍 آهنگ تشخیص داده نشد. یک بخش واضح‌تر ۱۰ تا ۳۰ ثانیه‌ای بفرستید.",
@@ -988,10 +992,6 @@ async def _do_video_download(update, context, url):
                 )
                 if audio_path:
                     song = await recognize_song(audio_path)
-                    if song and song[0]:
-                        full_song = await loop.run_in_executor(
-                            None, download_full_song, song[0], song[1], tmpdir
-                        )
 
         if full_song:
             song_path, found_title, found_artist = full_song
@@ -1008,14 +1008,18 @@ async def _do_video_download(update, context, url):
             final = (
                 "✅ ویدیو ارسال شد.\n\n"
                 f"🎵 آهنگ شناسایی شد: {song[0]} — {song[1] or 'نامشخص'}\n"
-                "❌ نسخه کامل قابل دریافت نبود."
+                "برای شنیدن نسخهٔ کامل یکی از سرویس‌های زیر را انتخاب کنید."
             )
         elif audio_path:
             final = "✅ ویدیو ارسال شد؛ نام آهنگ از این بخش قابل تشخیص نبود."
         else:
             final = "✅ رسانه ارسال شد؛ این فایل صدای قابل تشخیص نداشت."
 
-        await status.edit_text(final, reply_markup=_back_menu_kb())
+        await status.edit_text(
+            final,
+            reply_markup=_music_search_kb(song[0], song[1])
+            if song and song[0] else _back_menu_kb(),
+        )
     except InstagramRateLimitError:
         logger.warning("Instagram درخواست این IP را با 429 محدود کرد")
         await status.edit_text(
