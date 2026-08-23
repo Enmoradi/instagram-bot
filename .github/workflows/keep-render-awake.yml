@@ -1,0 +1,25 @@
+name: Keep Render bot awake
+
+on:
+  schedule:
+    # Offset from the top of the hour to reduce GitHub scheduler congestion.
+    - cron: "3,13,23,33,43,53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-keepalive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Send inbound health request
+        run: |
+          status=$(curl --silent --show-error --location             --max-time 90 --output /dev/null --write-out "%{http_code}"             "https://media-telegram-bot-epm5.onrender.com/")
+          echo "Render responded with HTTP $status"
+          test "$status" != "000"
