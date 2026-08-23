@@ -6,9 +6,11 @@
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -63,6 +65,49 @@ PORT = int(os.environ.get("PORT", "10000"))
 MAX_TELEGRAM_BYTES = 100 * 1024 * 1024
 HEIGHT_CAPS = [1080, 720, 480, 360, 240]
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
+INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
+PROXY_URLS = [
+    value.strip()
+    for value in re.split(r"[,\s]+", os.environ.get("PROXY_URLS", ""))
+    if value.strip()
+]
+BROWSER_USER_AGENT = os.environ.get(
+    "BROWSER_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
+
+
+class InstagramRateLimitError(RuntimeError):
+    """Instagram IP/session rate limit (HTTP 429)."""
+
+
+def _prepare_cookie_file():
+    """Cookie Netscape را از env رمزگذاری‌شده روی دیسک موقت می‌سازد."""
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        return COOKIES_FILE
+    if not INSTAGRAM_COOKIES_B64:
+        return None
+    try:
+        raw = base64.b64decode(INSTAGRAM_COOKIES_B64, validate=True)
+        text = raw.decode("utf-8").replace("\r\n", "\n")
+        if not text.startswith(("# Netscape HTTP Cookie File", "# HTTP Cookie File")):
+            raise ValueError("cookie file is not in Netscape format")
+        path = os.path.join(tempfile.gettempdir(), "instagram-cookies.txt")
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        logger.info("کوکی Instagram از متغیر امن محیطی بارگذاری شد")
+        return path
+    except Exception as exc:
+        logger.error("INSTAGRAM_COOKIES_B64 نامعتبر است: %s", exc)
+        return None
+
+
+RUNTIME_COOKIES_FILE = _prepare_cookie_file()
 
 # ---- ضداسپم و پایداری ----
 # تعداد تلاش مجدد روی خطای موقت شبکه
@@ -290,9 +335,20 @@ def _base_ydl_opts(dest_dir):
         "no_warnings": True,
         "noplaylist": True,
         "restrictfilenames": True,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "sleep_interval": 1,
+        "max_sleep_interval": 3,
+        "http_headers": {
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
-    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+    if RUNTIME_COOKIES_FILE and os.path.exists(RUNTIME_COOKIES_FILE):
+        opts["cookiefile"] = RUNTIME_COOKIES_FILE
+    if PROXY_URLS:
+        opts["proxy"] = random.choice(PROXY_URLS)
     return opts
 
 
@@ -321,9 +377,13 @@ def download_video(url, dest_dir):
                     info = ydl.extract_info(url, download=True)
                 break
             except Exception as exc:  # noqa: BLE001
-                logger.warning("دانلود (cap=%s تلاش=%s) ناموفق: %s", cap, attempt, exc)
+                message = str(exc)
+                logger.warning("دانلود (cap=%s تلاش=%s) ناموفق: %s", cap, attempt, message)
+                if "HTTP Error 429" in message or "rate-limit" in message.lower():
+                    # تکرار کیفیت‌های دیگر روی همان IP فقط محدودیت را شدیدتر می‌کند.
+                    raise InstagramRateLimitError(message) from exc
                 if attempt < DOWNLOAD_RETRIES:
-                    time.sleep(1.5)
+                    time.sleep(min(8, 2 ** attempt))
         if info is None:
             continue
 
@@ -738,6 +798,14 @@ async def _do_video_download(update, context, url):
             final = "✅ رسانه ارسال شد؛ این فایل صدای قابل تشخیص نداشت."
 
         await status.edit_text(final, reply_markup=_back_menu_kb())
+    except InstagramRateLimitError:
+        logger.warning("Instagram درخواست این IP را با 429 محدود کرد")
+        await status.edit_text(
+            "⚠️ Instagram موقتاً IP سرور را محدود کرده است.\n"
+            "لینک شما معتبر است؛ برای عبور پایدار، Cookie تازه یا Proxy سالم باید "
+            "در تنظیمات امن سرور فعال باشد.",
+            reply_markup=_back_menu_kb(),
+        )
     except Exception as exc:
         logger.exception("خطا در پردازش لینک %s: %s", platform, exc)
         try:

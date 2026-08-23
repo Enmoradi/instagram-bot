@@ -37,7 +37,10 @@
 | `RATE_LIMIT_PER_MIN` | خیر | تعداد درخواست هر کاربر در دقیقه |
 | `MAX_CONCURRENT` | خیر | سقف پردازش هم‌زمان |
 | `DOWNLOAD_RETRIES` | خیر | تعداد تلاش مجدد دانلود |
-| `COOKIES_FILE` | خیر | مسیر کوکی برای محتوای نیازمند ورود |
+| `COOKIES_FILE` | خیر | مسیر فایل Cookie با فرمت Netscape |
+| `INSTAGRAM_COOKIES_B64` | خیر | محتوای Base64 فایل Cookie؛ مناسب Environment امن Render |
+| `PROXY_URLS` | خیر | یک یا چند Proxy جداشده با کاما برای چرخش IP |
+| `BROWSER_USER_AGENT` | خیر | User-Agent همان مرورگری که Cookie از آن صادر شده |
 | `WEBHOOK_URL` | خیر | در Render خودکار تنظیم می‌شود |
 | `PORT` | خیر | پورت webhook؛ پیش‌فرض 10000 |
 
@@ -56,3 +59,15 @@ python bot.py
 سرویس با Docker و webhook اجرا می‌شود. Render به شاخه `master` متصل است و Auto-Deploy روی `On Commit` قرار دارد.
 
 > توکن ربات را هرگز در GitHub ذخیره نکنید. فقط آن را در Environment سرویس قرار دهید.
+
+
+## پایداری Instagram و خطای 429
+
+Instagram گاهی IPهای اشتراکی دیتاسنترها مانند Render را حتی برای محتوای عمومی محدود می‌کند.
+ربات روی 429 فوراً متوقف می‌شود تا مسدودیت را شدیدتر نکند و از این مسیرهای رسمی yt-dlp پشتیبانی می‌کند:
+
+1. Cookie تازه با فرمت Netscape در `INSTAGRAM_COOKIES_B64`
+2. User-Agent هماهنگ در `BROWSER_USER_AGENT`
+3. Proxy سالم در `PROXY_URLS`
+
+Cookie و Proxy محرمانه‌اند و نباید داخل مخزن Commit شوند.
