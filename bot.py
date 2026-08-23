@@ -36,6 +36,7 @@ from telegram.ext import (
     filters,
 )
 
+import requests
 import yt_dlp
 
 try:
@@ -71,6 +72,8 @@ PROXY_URLS = [
     for value in re.split(r"[,\s]+", os.environ.get("PROXY_URLS", ""))
     if value.strip()
 ]
+COBALT_API_URL = os.environ.get("COBALT_API_URL", "").strip().rstrip("/")
+COBALT_API_KEY = os.environ.get("COBALT_API_KEY", "").strip()
 BROWSER_USER_AGENT = os.environ.get(
     "BROWSER_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -405,6 +408,125 @@ def download_video(url, dest_dir):
     if last_path and last_path.lower().endswith((".jpg", ".jpeg", ".png")):
         return last_path, last_info.get("title", ""), last_info.get("uploader", "")
     return None
+
+
+def _cobalt_extension(filename, content_type):
+    """پسوند امن رسانه را از پاسخ Cobalt تعیین می‌کند."""
+    ext = os.path.splitext((filename or "").split("?", 1)[0])[1].lower()
+    if ext in (".mp4", ".webm", ".mkv", ".jpg", ".jpeg", ".png"):
+        return ext
+    ctype = (content_type or "").lower()
+    if "image/jpeg" in ctype:
+        return ".jpg"
+    if "image/png" in ctype:
+        return ".png"
+    if "video/webm" in ctype:
+        return ".webm"
+    return ".mp4"
+
+
+def download_via_cobalt(url, dest_dir):
+    """مسیر پشتیبان مستقل: دریافت یک نسخه معمولی از Cobalt خودمیزبان."""
+    if not COBALT_API_URL:
+        return None
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": BROWSER_USER_AGENT,
+    }
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+
+    payload = {
+        "url": url,
+        "videoQuality": "720",
+        "downloadMode": "auto",
+        "filenameStyle": "basic",
+        "alwaysProxy": True,
+    }
+    response = requests.post(
+        f"{COBALT_API_URL}/",
+        json=payload,
+        headers=headers,
+        timeout=(20, 150),
+    )
+    response.raise_for_status()
+    data = response.json()
+    status = data.get("status")
+
+    media_url = None
+    filename = data.get("filename") or "media"
+    if status in ("tunnel", "redirect"):
+        media_url = data.get("url")
+    elif status == "picker":
+        items = data.get("picker") or []
+        chosen = next((item for item in items if item.get("type") == "video"), None)
+        chosen = chosen or next((item for item in items if item.get("url")), None)
+        if chosen:
+            media_url = chosen.get("url")
+            filename = chosen.get("filename") or filename
+    elif status == "error":
+        error = data.get("error") or {}
+        raise RuntimeError(f"Cobalt: {error.get('code') or 'download failed'}")
+
+    if not media_url:
+        raise RuntimeError(f"Cobalt response unsupported: {status}")
+
+    download_headers = {"User-Agent": BROWSER_USER_AGENT}
+    if COBALT_API_KEY and media_url.startswith(COBALT_API_URL):
+        download_headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+    with requests.get(
+        media_url,
+        headers=download_headers,
+        stream=True,
+        allow_redirects=True,
+        timeout=(20, 180),
+    ) as media:
+        media.raise_for_status()
+        declared = int(media.headers.get("Content-Length") or 0)
+        if declared > MAX_TELEGRAM_BYTES:
+            raise RuntimeError("Cobalt media is larger than Telegram limit")
+        ext = _cobalt_extension(filename, media.headers.get("Content-Type"))
+        path = os.path.join(dest_dir, f"cobalt_media{ext}")
+        size = 0
+        with open(path, "wb") as handle:
+            for chunk in media.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > MAX_TELEGRAM_BYTES:
+                    raise RuntimeError("Cobalt media exceeded Telegram limit")
+                handle.write(chunk)
+
+    if size <= 0:
+        raise RuntimeError("Cobalt returned an empty media file")
+    title = os.path.splitext(os.path.basename(filename))[0]
+    source = SERVICE_LABELS.get(detect_platform(url), "").replace("📷 ", "").replace("📘 ", "")
+    return path, title, source
+
+
+def download_media(url, dest_dir):
+    """موتور اصلی، سپس fallback مستقل؛ جزئیات شکست فقط در لاگ می‌ماند."""
+    try:
+        result = download_video(url, dest_dir)
+        if result:
+            return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("موتور اصلی ناموفق شد؛ انتقال به fallback: %s", exc)
+
+    if not COBALT_API_URL:
+        return None
+    for name in os.listdir(dest_dir):
+        try:
+            os.remove(os.path.join(dest_dir, name))
+        except OSError:
+            pass
+    try:
+        return download_via_cobalt(url, dest_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("موتور Cobalt ناموفق شد: %s", exc)
+        return None
 
 
 def extract_audio_track(media_path, dest_dir):
@@ -749,7 +871,7 @@ async def _do_video_download(update, context, url):
         loop = asyncio.get_running_loop()
         async with _limiter:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
-            result = await loop.run_in_executor(None, download_video, url, tmpdir)
+            result = await loop.run_in_executor(None, download_media, url, tmpdir)
             if not result:
                 await status.edit_text(
                     "❌ دانلود انجام نشد. محتوا باید عمومی و لینک آن معتبر باشد.",
