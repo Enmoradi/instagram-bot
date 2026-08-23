@@ -368,6 +368,45 @@ def extract_audio_track(media_path, dest_dir):
         return None
 
 
+def download_full_song(title, artist, dest_dir):
+    """نسخه کامل آهنگ شناسایی‌شده را پیدا و به MP3 تبدیل می‌کند."""
+    query = " ".join(part for part in (title, artist) if part).strip()
+    if not query:
+        return None
+    opts = _base_ydl_opts(dest_dir)
+    opts.update({
+        "outtmpl": os.path.join(dest_dir, "full_%(id)s.%(ext)s"),
+        "format": "bestaudio/best",
+        "default_search": "ytsearch1",
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    })
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+        if isinstance(info, dict) and info.get("entries"):
+            info = next((entry for entry in info["entries"] if entry), {})
+        candidates = [
+            os.path.join(dest_dir, name)
+            for name in os.listdir(dest_dir)
+            if name.startswith("full_") and name.lower().endswith(".mp3")
+        ]
+        if not candidates:
+            return None
+        path = max(candidates, key=os.path.getsize)
+        if os.path.getsize(path) <= 0 or os.path.getsize(path) > MAX_TELEGRAM_BYTES:
+            return None
+        found_title = (info or {}).get("track") or (info or {}).get("title") or title
+        found_artist = (info or {}).get("artist") or (info or {}).get("uploader") or artist
+        return path, found_title, found_artist
+    except Exception as exc:
+        logger.warning("دریافت نسخه کامل آهنگ ناموفق بود: %s", exc)
+        return None
+
+
 async def recognize_song(audio_path):
     if not _SHAZAM_AVAILABLE:
         return None
@@ -586,9 +625,30 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result and result[0]:
             title, artist = result
             await status.edit_text(
-                f"🎵 آهنگ پیدا شد!\n\nعنوان: {title}\nخواننده: {artist or 'نامشخص'}",
-                reply_markup=_back_menu_kb(),
+                f"🎵 آهنگ پیدا شد!\n\nعنوان: {title}\nخواننده: {artist or 'نامشخص'}"
+                "\n\n⏳ در حال یافتن نسخه کامل..."
             )
+            loop = asyncio.get_running_loop()
+            async with _limiter:
+                full_song = await loop.run_in_executor(
+                    None, download_full_song, title, artist, tmpdir
+                )
+            if full_song:
+                song_path, found_title, found_artist = full_song
+                caption = f"🎵 {title}"
+                if artist:
+                    caption += f" — {artist}"
+                await _send_media_file(context, update.effective_chat.id, song_path, caption)
+                await status.edit_text(
+                    "✅ نسخه کامل آهنگ ارسال شد.",
+                    reply_markup=_back_menu_kb(),
+                )
+            else:
+                await status.edit_text(
+                    f"🎵 آهنگ شناسایی شد:\n{title} — {artist or 'نامشخص'}"
+                    "\n\n❌ نسخه کامل قابل دریافت نبود.",
+                    reply_markup=_back_menu_kb(),
+                )
         else:
             await status.edit_text(
                 "🔍 آهنگ تشخیص داده نشد. یک بخش واضح‌تر ۱۰ تا ۳۰ ثانیه‌ای بفرستید.",
@@ -638,37 +698,42 @@ async def _do_video_download(update, context, url):
             path, title, source = result
             audio_path = None
             song = None
+            full_song = None
             if path.lower().endswith((".mp4", ".mkv", ".webm")):
                 audio_path = await loop.run_in_executor(
                     None, extract_audio_track, path, tmpdir
                 )
                 if audio_path:
                     song = await recognize_song(audio_path)
+                    if song and song[0]:
+                        full_song = await loop.run_in_executor(
+                            None, download_full_song, song[0], song[1], tmpdir
+                        )
 
         await status.edit_text("📤 دانلود کامل شد؛ در حال ارسال ویدیو...")
         await _send_media_file(context, chat_id, path, _build_caption(title, source))
 
-        if audio_path:
-            audio_caption = "🎧 صدای استخراج‌شده از همین ویدیو"
-            if song and song[0]:
-                audio_caption += f"\n🎵 {song[0]}"
-                if song[1]:
-                    audio_caption += f" — {song[1]}"
-            await _send_media_file(context, chat_id, audio_path, audio_caption)
-
-        if song and song[0]:
+        if full_song:
+            song_path, found_title, found_artist = full_song
+            music_caption = f"🎵 {song[0]}"
+            if song[1]:
+                music_caption += f" — {song[1]}"
+            await _send_media_file(context, chat_id, song_path, music_caption)
             final = (
-                "✅ ویدیو و موسیقی ارسال شد.\n\n"
+                "✅ ویدیو و نسخه کامل آهنگ ارسال شد.\n\n"
                 f"🎵 آهنگ: {song[0]}\n"
                 f"🎤 خواننده: {song[1] or 'نامشخص'}"
             )
-        elif audio_path:
+        elif song and song[0]:
             final = (
-                "✅ ویدیو و فایل MP3 ارسال شد.\n"
-                "🔍 نام آهنگ از این بخش قابل تشخیص نبود."
+                "✅ ویدیو ارسال شد.\n\n"
+                f"🎵 آهنگ شناسایی شد: {song[0]} — {song[1] or 'نامشخص'}\n"
+                "❌ نسخه کامل قابل دریافت نبود."
             )
+        elif audio_path:
+            final = "✅ ویدیو ارسال شد؛ نام آهنگ از این بخش قابل تشخیص نبود."
         else:
-            final = "✅ رسانه ارسال شد؛ این فایل صدای قابل استخراج نداشت."
+            final = "✅ رسانه ارسال شد؛ این فایل صدای قابل تشخیص نداشت."
 
         await status.edit_text(final, reply_markup=_back_menu_kb())
     except Exception as exc:
