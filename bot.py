@@ -509,7 +509,7 @@ def download_via_cobalt(url, dest_dir):
 def normalize_media_url(url):
     """پارامترهای اشتراک Instagram و نویسه‌های اضافه را حذف می‌کند."""
     clean = (url or "").strip().rstrip(".,،؛;!?)\"]}'")
-    if re.search(r"(?:instagram\\.com|instagr\\.am)", clean, re.I):
+    if re.search(r"(?:instagram\.com|instagr\.am)", clean, re.I):
         clean = clean.split("?", 1)[0]
         if not clean.endswith("/"):
             clean += "/"
