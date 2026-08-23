@@ -651,6 +651,29 @@ def download_full_song(title, artist, dest_dir):
         return None
 
 
+def prepare_recognition_sample(source_path, dest_dir):
+    """هر فایل تلگرام را پیش از Shazam به نمونه WAV تمیز و کوتاه تبدیل می‌کند."""
+    output = os.path.join(dest_dir, "recognition_sample.wav")
+    command = [
+        "ffmpeg", "-y", "-i", source_path, "-vn", "-t", "45",
+        "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le", output,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=90,
+        )
+        if completed.returncode == 0 and os.path.exists(output) and os.path.getsize(output) > 0:
+            return output
+        logger.warning("آماده‌سازی نمونه Shazam ناموفق بود: %s", completed.stderr[-500:])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("خطا در آماده‌سازی نمونه Shazam: %s", exc)
+    return None
+
+
 async def recognize_song(audio_path):
     if not _SHAZAM_AVAILABLE:
         return None
@@ -864,8 +887,12 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await media.get_file()
         source = os.path.join(tmpdir, "sample")
         await tg_file.download_to_drive(source)
+        loop = asyncio.get_running_loop()
         async with _limiter:
-            result = await recognize_song(source)
+            prepared = await loop.run_in_executor(
+                None, prepare_recognition_sample, source, tmpdir
+            )
+            result = await recognize_song(prepared or source)
         if result and result[0]:
             title, artist = result
             await status.edit_text(
