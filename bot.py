@@ -545,7 +545,7 @@ def download_via_gallery_dl(url, dest_dir):
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        timeout=180,
+        timeout=25,
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace")[-600:]
@@ -573,9 +573,10 @@ def download_via_gallery_dl(url, dest_dir):
 def download_media(url, dest_dir):
     """سه موتور مستقل را به‌ترتیب امتحان می‌کند و فقط نتیجه را برمی‌گرداند."""
     clean_url = normalize_media_url(url)
-    engines = [("yt-dlp", download_video), ("gallery-dl", download_via_gallery_dl)]
+    engines = [("yt-dlp", download_video)]
     if COBALT_API_URL:
         engines.append(("cobalt", download_via_cobalt))
+    engines.append(("gallery-dl", download_via_gallery_dl))
 
     for engine_name, engine in engines:
         _clear_download_dir(dest_dir)
