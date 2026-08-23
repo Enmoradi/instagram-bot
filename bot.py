@@ -996,12 +996,6 @@ async def _do_video_download(update, context, url):
                     None, extract_audio_track, path, tmpdir
                 )
                 if audio_path:
-                    await _send_media_file(
-                        context,
-                        chat_id,
-                        audio_path,
-                        "🎧 صدای استخراج‌شده از همین ویدیو",
-                    )
                     song = await recognize_song(audio_path)
 
         if full_song:
@@ -1022,7 +1016,7 @@ async def _do_video_download(update, context, url):
                 "برای شنیدن نسخهٔ کامل یکی از سرویس‌های زیر را انتخاب کنید."
             )
         elif audio_path:
-            final = "✅ ویدیو و فایل MP3 آن ارسال شد؛ نام آهنگ قابل تشخیص نبود."
+            final = "✅ ویدیو ارسال شد؛ نام آهنگ از این بخش قابل تشخیص نبود."
         else:
             final = "✅ رسانه ارسال شد؛ این فایل صدایی برای تبدیل به MP3 نداشت."
 
