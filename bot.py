@@ -506,27 +506,87 @@ def download_via_cobalt(url, dest_dir):
     return path, title, source
 
 
-def download_media(url, dest_dir):
-    """موتور اصلی، سپس fallback مستقل؛ جزئیات شکست فقط در لاگ می‌ماند."""
-    try:
-        result = download_video(url, dest_dir)
-        if result:
-            return result
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("موتور اصلی ناموفق شد؛ انتقال به fallback: %s", exc)
+def normalize_media_url(url):
+    """پارامترهای اشتراک Instagram و نویسه‌های اضافه را حذف می‌کند."""
+    clean = (url or "").strip().rstrip(".,،؛;!?)\"]}'")
+    if re.search(r"(?:instagram\\.com|instagr\\.am)", clean, re.I):
+        clean = clean.split("?", 1)[0]
+        if not clean.endswith("/"):
+            clean += "/"
+    return clean
 
-    if not COBALT_API_URL:
+
+def _clear_download_dir(dest_dir):
+    for root, dirs, files in os.walk(dest_dir, topdown=False):
+        for name in files:
+            try:
+                os.remove(os.path.join(root, name))
+            except OSError:
+                pass
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(root, name))
+            except OSError:
+                pass
+
+
+def download_via_gallery_dl(url, dest_dir):
+    """موتور دوم مستقل برای پست، Reel و مجموعه‌رسانه‌های عمومی."""
+    command = [
+        "gallery-dl",
+        "--no-input",
+        "--quiet",
+        "--directory", dest_dir,
+        "--range", "1-5",
+        url,
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=180,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace")[-600:]
+        raise RuntimeError(f"gallery-dl exited {completed.returncode}: {detail}")
+
+    candidates = []
+    for root, _, files in os.walk(dest_dir):
+        for name in files:
+            path = os.path.join(root, name)
+            if name.lower().endswith((".mp4", ".webm", ".mkv", ".jpg", ".jpeg", ".png")):
+                if 0 < os.path.getsize(path) <= MAX_TELEGRAM_BYTES:
+                    candidates.append(path)
+    if not candidates:
         return None
-    for name in os.listdir(dest_dir):
+
+    videos = [
+        path for path in candidates
+        if path.lower().endswith((".mp4", ".webm", ".mkv"))
+    ]
+    chosen = max(videos or candidates, key=os.path.getsize)
+    source = SERVICE_LABELS.get(detect_platform(url), "").replace("📷 ", "").replace("📘 ", "")
+    return chosen, "", source
+
+
+def download_media(url, dest_dir):
+    """سه موتور مستقل را به‌ترتیب امتحان می‌کند و فقط نتیجه را برمی‌گرداند."""
+    clean_url = normalize_media_url(url)
+    engines = [("yt-dlp", download_video), ("gallery-dl", download_via_gallery_dl)]
+    if COBALT_API_URL:
+        engines.append(("cobalt", download_via_cobalt))
+
+    for engine_name, engine in engines:
+        _clear_download_dir(dest_dir)
         try:
-            os.remove(os.path.join(dest_dir, name))
-        except OSError:
-            pass
-    try:
-        return download_via_cobalt(url, dest_dir)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("موتور Cobalt ناموفق شد: %s", exc)
-        return None
+            result = engine(clean_url, dest_dir)
+            if result:
+                logger.info("دانلود موفق با موتور %s", engine_name)
+                return result
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("موتور %s ناموفق شد: %s", engine_name, exc)
+    return None
 
 
 def extract_audio_track(media_path, dest_dir):
