@@ -801,9 +801,7 @@ async def _do_video_download(update, context, url):
     except InstagramRateLimitError:
         logger.warning("Instagram درخواست این IP را با 429 محدود کرد")
         await status.edit_text(
-            "⚠️ Instagram موقتاً IP سرور را محدود کرده است.\n"
-            "لینک شما معتبر است؛ برای عبور پایدار، Cookie تازه یا Proxy سالم باید "
-            "در تنظیمات امن سرور فعال باشد.",
+            "❌ در حال حاضر دریافت این رسانه ممکن نشد. لطفاً کمی بعد دوباره تلاش کنید.",
             reply_markup=_back_menu_kb(),
         )
     except Exception as exc:
