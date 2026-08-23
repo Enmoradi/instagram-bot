@@ -63,7 +63,7 @@ WEBHOOK_URL = (
 ).rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 MAX_TELEGRAM_BYTES = 100 * 1024 * 1024
-HEIGHT_CAPS = [1080, 720, 480, 360, 240]
+HEIGHT_CAPS = [720]  # یک کیفیت معمولی؛ از درخواست‌های چندکیفی جلوگیری می‌کند
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
 PROXY_URLS = [
@@ -353,7 +353,7 @@ def _base_ydl_opts(dest_dir):
 
 
 def download_video(url, dest_dir):
-    """خروجی: (مسیر، عنوان، منبع) زیر سقف ارسال تلگرام، یا None."""
+    """فقط یک نسخه معمولی تا 720p را دانلود می‌کند."""
     last_path = None
     last_info = {}
     for cap in HEIGHT_CAPS:
