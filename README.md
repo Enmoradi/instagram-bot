@@ -11,7 +11,7 @@
 3. ویدیو یا تصویر را برای کاربر می‌فرستد.
 4. صدای ویدیو را موقتاً برای تشخیص آماده می‌کند؛ این صدای ناقص ارسال نمی‌شود.
 5. آهنگ را با Shazam شناسایی می‌کند.
-6. نسخه کامل آهنگ شناسایی‌شده را پیدا، به MP3 تبدیل و ارسال می‌کند.
+6. لینک‌های جست‌وجوی آهنگ را می‌فرستد. با `FULL_SONG_DOWNLOAD=true` دریافت و ارسال نسخه کامل MP3 نیز فعال می‌شود؛ در صورت شکست، لینک‌ها همچنان در دسترس‌اند.
 
 فایل صوتی، Voice، Video و Video Note ارسالی کاربر نیز مستقیماً برای شناسایی آهنگ پذیرفته می‌شود.
 
@@ -43,6 +43,7 @@
 | `BROWSER_USER_AGENT` | خیر | User-Agent همان مرورگری که Cookie از آن صادر شده |
 | `WEBHOOK_URL` | خیر | در Render خودکار تنظیم می‌شود |
 | `PORT` | خیر | پورت webhook؛ پیش‌فرض 10000 |
+| `FULL_SONG_DOWNLOAD` | خیر | ارسال نسخه کامل MP3؛ پیش‌فرض `false` |
 
 ## اجرا
 
@@ -71,3 +72,17 @@ Instagram گاهی IPهای اشتراکی دیتاسنترها مانند Rende
 3. Proxy سالم در `PROXY_URLS`
 
 Cookie و Proxy محرمانه‌اند و نباید داخل مخزن Commit شوند.
+
+## Reliability and testing
+
+- Only HTTP(S) links on Instagram/Facebook domains are accepted; URL credentials and nonstandard ports are rejected.
+- Each user can have one pending job. Up to 32 jobs may be admitted globally; the existing admin concurrency setting controls active video processing. These resource safeguards apply even when optional rate limits are disabled.
+- Video/audio uploads are capped at 49 MiB. Images over 9 MiB and WebM/MKV files are sent as documents. Oversized files are rejected rather than automatically compressed.
+- Music recognition uses a 45-second sample and a 60-second recognition timeout. Direct Telegram recognition uploads must be at most 20 MiB unless usable audio metadata is provided.
+- `FULL_SONG_DOWNLOAD=true` enables best-match YouTube song search and MP3 conversion. Search results are not guaranteed to be the exact recording. FFmpeg is required.
+- Instagram HTTP 429 stops the fallback chain to avoid additional rate-limited requests.
+- Settings and user lists still require a persistent `DATA_DIR` to survive redeploys; the included free Render configuration does not provision persistent storage.
+
+Run offline regression tests with `python -m unittest discover -s tests -v`.
+GitHub Actions additionally installs dependencies and checks that the full bot module imports.
+Live download, recognition, and Telegram delivery require a configured deployment and are separate integration checks.
