@@ -39,6 +39,9 @@ from telegram.ext import (
 
 import requests
 import yt_dlp
+from music_ui import MusicUI
+
+_music_ui = None
 
 try:
     from shazamio import Shazam  # type: ignore
@@ -312,6 +315,9 @@ PROMPTS = {
 
 def main_menu():
     rows = [
+        [InlineKeyboardButton("🔎 جستجو و تشخیص آهنگ", callback_data="music:search")],
+        [InlineKeyboardButton("❤️ علاقه‌مندی‌ها", callback_data="music:favorites"),
+         InlineKeyboardButton("🕘 آهنگ‌های اخیر", callback_data="music:recent")],
         [
             InlineKeyboardButton(SERVICE_LABELS["instagram"], callback_data="mode:instagram"),
             InlineKeyboardButton(SERVICE_LABELS["facebook"], callback_data="mode:facebook"),
@@ -327,6 +333,8 @@ def _back_menu_kb():
 
 
 def _music_search_kb(title, artist=""):
+    if _music_ui:
+        return _music_ui.recognition_keyboard(title, artist)
     query = quote_plus(" ".join(x for x in (title, artist) if x).strip())
     return InlineKeyboardMarkup([
         [
@@ -374,6 +382,7 @@ def _base_ydl_opts(dest_dir):
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "js_runtimes": {"node": {}},
         "max_filesize": MAX_TELEGRAM_BYTES,
         "playlistend": 1,
         "restrictfilenames": True,
@@ -822,16 +831,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await require_membership(update, context, uid):
         return
+    if _music_ui and await _music_ui.start_payload(update, context):
+        return
     await update.message.reply_text(
-        f"👋 {_config.get('welcome')}\n\nیک سرویس انتخاب کنید 👇",
+        f"👋 {_config.get('welcome')}\n\n"
+        "🎵 نام آهنگ، خواننده یا بخشی از شعر را بنویسید.\n"
+        "🎙 برای شناسایی آهنگ، وویس، فایل صوتی یا ویدیو بفرستید.\n"
+        "📷 لینک اینستاگرام یا فیسبوک را هم می‌توانید بفرستید.",
         reply_markup=main_menu(),
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "کافی است لینک عمومی اینستاگرام یا فیسبوک را بفرستید.\n"
-        "ربات ویدیو، فایل MP3 و نتیجه تشخیص آهنگ را برایتان ارسال می‌کند."
+        "🎵 نام آهنگ، خواننده یا بخشی از شعر را بنویسید و از نتایج انتخاب کنید.\n"
+        "🎙 برای شناسایی، وویس یا ویدیوی کوتاه و واضح بفرستید.\n"
+        "📷 لینک عمومی اینستاگرام یا فیسبوک نیز پذیرفته می‌شود.\n"
+        "/search — جستجوی آهنگ\n/favorites — علاقه‌مندی‌ها\n"
+        "/recent — آهنگ‌های اخیر\n/forget — پاک کردن تاریخچه و علاقه‌مندی‌ها\n"
+        "جستجوی متن ترانه، صفحهٔ جستجوی بیرونی را باز می‌کند."
     )
 
 
@@ -916,13 +934,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _do_video_download(update, context, url_match.group(0))
         return
 
-    if mode in ("instagram", "facebook"):
-        await update.message.reply_text("❌ لطفاً یک لینک معتبر بفرستید.")
-    else:
-        await update.message.reply_text(
-            "لطفاً اول با /start یک سرویس انتخاب کنید یا یک لینک بفرستید.",
-            reply_markup=main_menu(),
-        )
+    if _music_ui:
+        await _music_ui.search(update, context, text)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -946,7 +959,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = await update.message.reply_text("🎧 در حال شنیدن و تشخیص آهنگ...")
         tmpdir = tempfile.mkdtemp(prefix="recognize_")
         msg = update.message
-        media = msg.voice or msg.audio or msg.video or msg.video_note
+        media = msg.voice or msg.audio or msg.video or msg.video_note or msg.document
         if not media:
             await status.edit_text("❌ فایل قابل پردازشی پیدا نشد.")
             return
@@ -1356,6 +1369,10 @@ async def _post_init(app):
     public = [
         BotCommand("start", "شروع / منوی اصلی"),
         BotCommand("help", "راهنما"),
+        BotCommand("search", "جستجوی آهنگ"),
+        BotCommand("favorites", "آهنگ‌های موردعلاقه"),
+        BotCommand("recent", "آهنگ‌های اخیر"),
+        BotCommand("forget", "پاک کردن تاریخچهٔ آهنگ‌ها"),
         BotCommand("id", "نمایش آی‌دی عددی من"),
     ]
     await app.bot.set_my_commands(public, scope=BotCommandScopeDefault())
@@ -1369,10 +1386,15 @@ async def _post_init(app):
 
 
 def main():
+    global _music_ui
     if not BOT_TOKEN:
         raise SystemExit("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
 
     load_state()
+    _music_ui = MusicUI(
+        DATA_DIR, BOT_TOKEN.split(":", 1)[0], lambda: _config,
+        _acquire_job, _user_busy.discard, _limiter, require_membership, is_admin,
+    )
     logger.info("ادمین‌ها: %s | کاربران ذخیره‌شده: %d", ADMIN_IDS or "—", len(_users))
 
     app = (
@@ -1391,13 +1413,14 @@ def main():
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("cancel", cancel))
+    _music_ui.register(app)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(on_menu_back, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(on_checkjoin, pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(on_admin, pattern=r"^adm:"))
     app.add_handler(
         MessageHandler(
-            filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE,
+            filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.AUDIO | filters.Document.VIDEO,
             handle_audio,
         )
     )

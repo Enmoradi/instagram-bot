@@ -1,6 +1,33 @@
-# Instagram & Facebook Media Bot
+# Music Search, Recognition & Media Bot
 
-ربات حرفه‌ای تلگرام برای دانلود رسانه از Instagram و Facebook و یافتن نسخه کامل موسیقی ویدیو.
+ربات تلگرام برای جستجوی آهنگ، تشخیص موسیقی از وویس و ویدیو، دریافت MP3 و دانلود رسانه از Instagram و Facebook.
+
+## تجربهٔ کاربری موسیقی
+
+- نام آهنگ، خواننده یا بخشی از شعر را فارسی یا انگلیسی بفرستید؛ تا پنج نتیجهٔ جستجو نمایش داده می‌شود.
+- نتیجه را انتخاب کنید تا همان نسخه به MP3 تبدیل و ارسال شود؛ دانلود تعاملی به `FULL_SONG_DOWNLOAD` وابسته نیست.
+- وویس، صوت، ویدیو یا فایل صوتی/ویدیویی بفرستید؛ پس از تشخیص، دکمهٔ «انتخاب و دانلود MP3» نتایج آهنگ را نشان می‌دهد.
+- با دکمهٔ قلب آهنگ را ذخیره کنید. `/favorites` علاقه‌مندی‌ها و `/recent` آهنگ‌های اخیر را در گفت‌وگوی خصوصی نشان می‌دهند.
+- `/forget` تاریخچهٔ موسیقی و علاقه‌مندی‌های شما را حذف می‌کند. آمار کاربران مدیریتی جداست.
+- جستجوی Inline با نوشتن `@YourBotUsername نام آهنگ` کار می‌کند. نتیجه، کارت اشتراک‌گذاری با لینک دریافت در ربات است؛ ارسال مستقیم صوت داخل Inline نیست.
+- برای فعال‌سازی Inline، در BotFather دستور `/setinline` را برای ربات خود تنظیم کنید. وقتی عضویت اجباری روشن است، نتایج Inline غیرفعال‌اند؛ جستجوی خصوصی پس از بررسی عضویت کار می‌کند.
+
+جستجو از YouTube استفاده می‌کند؛ جستجو با بخشی از شعر تضمین تطبیق دقیق ندارد. دکمهٔ «جستجوی متن ترانه» جستجوی Genius را باز می‌کند و متن کامل ترانه را در ربات نمایش نمی‌دهد. این پروژه به کاتالوگ خصوصی WhatsMusic متصل نیست و تشخیص زمزمه یا آواز زنده تضمین نمی‌شود.
+
+## اجرای نسخهٔ جدید
+
+Docker شامل Python، FFmpeg و Node 22 برای نیازهای فعلی yt-dlp است. برای اجرای مستقیم علاوه بر وابستگی‌های Python، FFmpeg و Node 22 یا جدیدتر را نصب کنید.
+
+متغیرهای اختیاری موسیقی:
+
+| متغیر | کاربرد |
+|---|---|
+| `MUSIC_COOKIES_FILE` | کوکی Netscape برای منبع جستجو/دانلود موسیقی؛ مستقل از کوکی Instagram |
+| `MUSIC_PROXY_URL` | پراکسی اختیاری جستجو و دانلود موسیقی |
+
+فایل `music_<bot-id>.sqlite3` در `DATA_DIR` آهنگ‌های اخیر، علاقه‌مندی‌ها و شناسهٔ فایل تلگرام را نگه می‌دارد. فایل MP3 پس از ارسال حذف می‌شود. تا ۲۰ آهنگ اخیر و ۱۰۰ علاقه‌مندی برای هر کاربر نگه‌داری می‌شود؛ فهرست‌ها صفحه‌بندی دارند. دیسک پایدار برای حفظ این اطلاعات پس از استقرار مجدد لازم است.
+
+جستجو پس از ۲۵ ثانیه و دانلود تعاملی پس از ۱۸۰ ثانیه متوقف می‌شود. در کانتینر Linux پردازش‌های فرزند هم متوقف می‌شوند. آهنگ زنده، بیش از ۱۵ دقیقه یا فایل بیش از ۴۹ MiB پذیرفته نمی‌شود. دسترسی به منبع ممکن است به IP، کوکی و محدودیت‌های سرویس وابسته باشد.
 
 ## گردش کار
 
@@ -83,6 +110,6 @@ Cookie و Proxy محرمانه‌اند و نباید داخل مخزن Commit �
 - Instagram HTTP 429 stops the fallback chain to avoid additional rate-limited requests.
 - Settings and user lists still require a persistent `DATA_DIR` to survive redeploys; the included free Render configuration does not provision persistent storage.
 
-Run offline regression tests with `python -m unittest discover -s tests -v`.
+Install `requirements.txt`, then run offline regression tests with `python -m unittest discover -s tests -v`.
 GitHub Actions additionally installs dependencies and checks that the full bot module imports.
 Live download, recognition, and Telegram delivery require a configured deployment and are separate integration checks.

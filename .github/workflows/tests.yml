@@ -11,3 +11,5 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -c "import bot"
       - run: python -m unittest discover -s tests -v
+      - run: docker build -t music-bot:test .
+      - run: docker run --rm music-bot:test python -c "import bot, music_ui, music_worker; import subprocess; subprocess.run(['node', '--version'], check=True); subprocess.run(['ffmpeg', '-version'], check=True)"
