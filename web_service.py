@@ -23,8 +23,8 @@ class HealthHandler(tornado.web.RequestHandler):
 
 
 class TelegramHandler(tornado.web.RequestHandler):
-    def initialize(self, application, secret):
-        self.application_bot = application
+    def initialize(self, bot_application, secret):
+        self.application_bot = bot_application
         self.secret = secret
 
     async def post(self):
@@ -50,7 +50,7 @@ def routes(application, secret, state):
     return tornado.web.Application([
         (r'/healthz', HealthHandler, {'state': state}),
         (r'/', HealthHandler, {'state': state}),
-        (r'/telegram', TelegramHandler, {'application': application, 'secret': secret}),
+        (r'/telegram', TelegramHandler, {'bot_application': application, 'secret': secret}),
     ])
 
 
