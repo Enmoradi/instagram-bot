@@ -40,6 +40,7 @@ from telegram.ext import (
 import requests
 import yt_dlp
 from music_ui import MusicUI
+from web_service import serve
 
 _music_ui = None
 
@@ -1401,6 +1402,7 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .concurrent_updates(32)
+        .update_queue(asyncio.Queue(maxsize=256))
         .connect_timeout(15)
         .read_timeout(60)
         .write_timeout(120)
@@ -1429,13 +1431,7 @@ def main():
 
     if WEBHOOK_URL:
         logger.info("اجرا در حالت webhook روی پورت %s", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            drop_pending_updates=True,
-        )
+        asyncio.run(serve(app, BOT_TOKEN, WEBHOOK_URL, PORT))
     else:
         logger.info("اجرا در حالت polling")
         app.run_polling(drop_pending_updates=True)

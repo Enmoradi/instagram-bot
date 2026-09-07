@@ -2,6 +2,7 @@
 import asyncio
 from collections import OrderedDict
 import json
+import io
 import logging
 import os
 import signal
@@ -11,11 +12,12 @@ import time
 from urllib.parse import quote_plus
 
 from telegram import (InlineKeyboardButton as Button, InlineKeyboardMarkup as Keyboard,
-                      InlineQueryResultArticle, InputTextMessageContent)
+                      InlineQueryResultArticle, InlineQueryResultCachedAudio, InputTextMessageContent)
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, InlineQueryHandler
 
 from music_store import MusicStore
+from lyrics import fetch_lyrics
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +111,7 @@ class MusicUI:
         key = self.store.put(title, artist)
         return Keyboard([
             [Button('🎵 انتخاب و دانلود MP3', callback_data='music:dl:' + key)],
+            [Button('📝 متن ترانه', callback_data='music:lyrics:' + key)],
             [Button('🔎 جستجوی متن ترانه', url='https://genius.com/search?q=' + quote_plus(title + ' ' + artist))],
             [Button('🏠 منوی اصلی', callback_data='menu')],
         ])
@@ -116,6 +119,7 @@ class MusicUI:
     def track_keyboard(self, track):
         return Keyboard([
             [Button('❤️ افزودن / حذف علاقه‌مندی', callback_data='music:favorite:' + track['id'])],
+            [Button('📝 متن ترانه', callback_data='music:lyrics:' + track['id'])],
             [Button('🔎 جستجوی متن ترانه', url='https://genius.com/search?q=' + quote_plus(track['title'] + ' ' + track['artist']))],
             [Button('🔎 آهنگ دیگر', callback_data='music:search')],
         ])
@@ -211,6 +215,8 @@ class MusicUI:
             await self.library(update, context, action == 'favpage', min(90, int(parts[2])))
         elif len(parts) == 3 and action == 'dl':
             await self.download(update, context, parts[2])
+        elif len(parts) == 3 and action in ('lyrics', 'lrc'):
+            await self.lyrics(update, context, action, parts[2])
         elif len(parts) == 3 and action == 'favorite':
             if not self.store.get(parts[2]):
                 await update.effective_message.reply_text('این نتیجه قدیمی است؛ دوباره جستجو کنید.')
@@ -220,6 +226,45 @@ class MusicUI:
                 await update.effective_message.reply_text('❤️ به علاقه‌مندی‌ها اضافه شد.' if enabled else 'از علاقه‌مندی‌ها حذف شد.')
             except ValueError:
                 await update.effective_message.reply_text('حداکثر ۱۰۰ علاقه‌مندی؛ ابتدا یک آهنگ را حذف کنید.')
+
+    async def lyrics(self, update, context, action, key):
+        uid = update.effective_user.id
+        if not await self.acquire(update, uid):
+            return
+        try:
+            if action == 'lyrics':
+                track = self.store.get(key)
+                if not track:
+                    await update.effective_message.reply_text('نتیجه قدیمی است؛ دوباره جستجو کنید.')
+                    return
+                entries = await fetch_lyrics('search', {'q': track['title']})
+                rows = []
+                for entry in entries:
+                    if isinstance(entry.get('id'), int) and entry.get('plainLyrics'):
+                        label = (entry.get('trackName', '') + ' — ' + entry.get('artistName', ''))[:70]
+                        rows.append([Button(label, callback_data='music:lrc:' + str(entry['id']))])
+                    if len(rows) == 5:
+                        break
+                await update.effective_message.reply_text(
+                    '📝 نسخهٔ متن ترانه را انتخاب کنید (منبع: LRCLIB):' if rows else 'متن این آهنگ در منبع پیدا نشد.',
+                    reply_markup=Keyboard(rows) if rows else None)
+            elif key.isdigit():
+                entry = await fetch_lyrics('get/' + key)
+                content = entry.get('plainLyrics') or ''
+                if not content:
+                    await update.effective_message.reply_text('متن این نسخه در دسترس نیست.')
+                    return
+                heading = ('📝 ' + entry.get('trackName', '') + ' — ' + entry.get('artistName', '') + '\nمنبع: LRCLIB\n\n')[:400]
+                if len((heading + content).encode('utf-16-le')) // 2 <= 3900:
+                    await update.effective_message.reply_text(heading + content)
+                else:
+                    await context.bot.send_document(update.effective_chat.id,
+                        document=io.BytesIO(content.encode('utf-8')), filename='lyrics.txt', caption=heading)
+        except Exception:
+            log.warning('Lyrics lookup failed', exc_info=True)
+            await update.effective_message.reply_text('سرویس متن ترانه فعلاً پاسخ نداد؛ کمی بعد دوباره تلاش کنید.')
+        finally:
+            self.release(uid)
 
     async def library(self, update, context, favorites, offset=0):
         if not await self.allowed(update, context):
@@ -276,6 +321,9 @@ class MusicUI:
             for key in keys:
                 track = self.store.get(key)
                 if not track:
+                    continue
+                if track['file_id']:
+                    results.append(InlineQueryResultCachedAudio(id=key, audio_file_id=track['file_id']))
                     continue
                 url = f'https://t.me/{context.bot.username}?start=song_{key}'
                 results.append(InlineQueryResultArticle(

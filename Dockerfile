@@ -13,6 +13,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py music_ui.py music_store.py music_worker.py ./
+COPY bot.py music_ui.py music_store.py music_worker.py lyrics.py web_service.py ./
 
 CMD ["python", "bot.py"]

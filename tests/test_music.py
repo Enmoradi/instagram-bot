@@ -131,6 +131,25 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.ui.start_payload(self.update, self.context))
         self.ui.download.assert_awaited_once_with(self.update, self.context, 'abc')
 
+    async def test_inline_cached_track_sends_audio(self):
+        key = self.ui.store.put('Song', source_id='abcdefghijk')
+        self.ui.store.cache(key, 'cached-audio')
+        self.ui.search_tracks = AsyncMock(return_value=[key])
+        query = SimpleNamespace(from_user=SimpleNamespace(id=1), query='Song', answer=AsyncMock())
+        await self.ui.inline(SimpleNamespace(inline_query=query), self.context)
+        self.assertEqual(query.answer.call_args.args[0][0].audio_file_id, 'cached-audio')
+
+    async def test_lyrics_delivered_and_slot_released(self):
+        with patch('music_ui.fetch_lyrics', AsyncMock(return_value={'trackName':'Test', 'artistName':'Test', 'plainLyrics':'Original test fixture text'})):
+            await self.ui.lyrics(self.update, self.context, 'lrc', '1')
+        self.assertIn('Original test fixture text', self.message.reply_text.call_args.args[0])
+        self.assertEqual(self.busy, set())
+
+    async def test_lyrics_provider_failure_releases_slot(self):
+        with patch('music_ui.fetch_lyrics', AsyncMock(side_effect=RuntimeError('offline'))):
+            await self.ui.lyrics(self.update, self.context, 'lrc', '1')
+        self.assertEqual(self.busy, set())
+
 
 if __name__ == '__main__':
     unittest.main()

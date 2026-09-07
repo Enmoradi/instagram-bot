@@ -3,7 +3,7 @@ name: Keep Render bot awake
 on:
   schedule:
     # Offset from the top of the hour to reduce GitHub scheduler congestion.
-    - cron: "3,13,23,33,43,53 * * * *"
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,10 +16,13 @@ concurrency:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
       - name: Send inbound health request
         run: |
-          status=$(curl --silent --show-error --location             --max-time 90 --output /dev/null --write-out "%{http_code}"             "https://media-telegram-bot-epm5.onrender.com/")
-          echo "Render responded with HTTP $status"
-          test "$status" != "000"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 15 --max-time 90 \
+            --retry 2 --retry-delay 5 --retry-max-time 180 \
+            "https://media-telegram-bot-epm5.onrender.com/healthz" \
+            --output health.json
+          python -c "import json; data=json.load(open('health.json')); assert data.get('status') == 'ok' and data.get('service') == 'music-bot', data; print(data)"
