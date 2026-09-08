@@ -1,5 +1,5 @@
 python-telegram-bot[webhooks]==20.7
-yt-dlp
+yt-dlp[default]
 shazamio
 requests>=2.32,<3
 gallery-dl>=1.30,<2

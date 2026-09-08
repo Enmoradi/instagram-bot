@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 from telegram import (
     BotCommand,
@@ -39,6 +39,10 @@ from telegram.ext import (
 
 import requests
 import yt_dlp
+from music_ui import MusicUI
+from web_service import serve
+
+_music_ui = None
 
 try:
     from shazamio import Shazam  # type: ignore
@@ -64,7 +68,11 @@ WEBHOOK_URL = (
     or ""
 ).rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
-MAX_TELEGRAM_BYTES = 100 * 1024 * 1024
+MAX_TELEGRAM_BYTES = 49 * 1024 * 1024
+MAX_PHOTO_BYTES = 9 * 1024 * 1024
+MAX_PENDING_JOBS = 32
+RECOGNITION_TIMEOUT = 60
+FULL_SONG_DOWNLOAD = os.environ.get("FULL_SONG_DOWNLOAD", "false").lower() == "true"
 HEIGHT_CAPS = [720]  # یک کیفیت معمولی؛ از درخواست‌های چندکیفی جلوگیری می‌کند
 COOKIES_FILE = os.environ.get("COOKIES_FILE")
 INSTAGRAM_COOKIES_B64 = os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
@@ -120,7 +128,7 @@ RUNTIME_COOKIES_FILE = _prepare_cookie_file()
 
 # ---- ضداسپم و پایداری ----
 # تعداد تلاش مجدد روی خطای موقت شبکه
-DOWNLOAD_RETRIES = int(os.environ.get("DOWNLOAD_RETRIES", "2"))
+DOWNLOAD_RETRIES = max(1, min(5, int(os.environ.get("DOWNLOAD_RETRIES", "2"))))
 
 _user_hits = {}   # uid -> [timestamps]
 _user_busy = set()  # کاربرانی که همین الان یک درخواست در حال پردازش دارند
@@ -147,26 +155,30 @@ _limiter = _DynamicLimiter()
 
 
 def _rate_limited(uid):
-    now = time.time()
+    now = time.monotonic()
+    for key in list(_user_hits):
+        if not _user_hits[key] or now - _user_hits[key][-1] >= 60:
+            del _user_hits[key]
     hits = [t for t in _user_hits.get(uid, []) if now - t < 60]
+    if len(hits) >= max(1, int(_config.get("rate_per_min", 15))):
+        _user_hits[uid] = hits
+        return True
     hits.append(now)
     _user_hits[uid] = hits
     return len(hits) > max(1, int(_config.get("rate_per_min", 15)))
 
 
 async def _acquire_job(update, uid):
-    """کنترل محدودیت کاربر. اگر «محدودیت کاربران» خاموش باشد یا کاربر ادمین
-    باشد، هیچ محدودیتی اعمال نمی‌شود و ربات تا حداکثر توان کار می‌کند."""
-    if not _config.get("user_limits") or is_admin(uid):
-        return True
-    if _rate_limited(uid):
+    """Always bound queued work; apply optional per-user rate limits."""
+    if uid in _user_busy:
+        await update.effective_message.reply_text("⏳ درخواست قبلی شما هنوز در حال پردازش است.")
+        return False
+    if len(_user_busy) >= MAX_PENDING_JOBS:
+        await update.effective_message.reply_text("⏳ ظرفیت ربات تکمیل است؛ کمی بعد دوباره تلاش کنید.")
+        return False
+    if _config.get("user_limits") and not is_admin(uid) and _rate_limited(uid):
         await update.effective_message.reply_text(
             "⏳ تعداد درخواست‌های شما زیاد است. لطفاً یک دقیقه صبر کنید."
-        )
-        return False
-    if uid in _user_busy:
-        await update.effective_message.reply_text(
-            "⏳ درخواست قبلی شما هنوز در حال پردازش است؛ کمی صبر کنید."
         )
         return False
     _user_busy.add(uid)
@@ -304,6 +316,9 @@ PROMPTS = {
 
 def main_menu():
     rows = [
+        [InlineKeyboardButton("🔎 جستجو و تشخیص آهنگ", callback_data="music:search")],
+        [InlineKeyboardButton("❤️ علاقه‌مندی‌ها", callback_data="music:favorites"),
+         InlineKeyboardButton("🕘 آهنگ‌های اخیر", callback_data="music:recent")],
         [
             InlineKeyboardButton(SERVICE_LABELS["instagram"], callback_data="mode:instagram"),
             InlineKeyboardButton(SERVICE_LABELS["facebook"], callback_data="mode:facebook"),
@@ -319,6 +334,8 @@ def _back_menu_kb():
 
 
 def _music_search_kb(title, artist=""):
+    if _music_ui:
+        return _music_ui.recognition_keyboard(title, artist)
     query = quote_plus(" ".join(x for x in (title, artist) if x).strip())
     return InlineKeyboardMarkup([
         [
@@ -366,6 +383,9 @@ def _base_ydl_opts(dest_dir):
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "js_runtimes": {"node": {}},
+        "max_filesize": MAX_TELEGRAM_BYTES,
+        "playlistend": 1,
         "restrictfilenames": True,
         "retries": 3,
         "fragment_retries": 3,
@@ -428,14 +448,10 @@ def download_video(url, dest_dir):
         if not files:
             continue
         last_path = max(files, key=os.path.getsize)
-        if os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES or last_path.lower().endswith(
-            (".jpg", ".jpeg", ".png")
-        ):
+        if 0 < os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES:
             title = last_info.get("title") or ""
             source = last_info.get("uploader") or last_info.get("extractor_key") or ""
             return last_path, title, source
-    if last_path and last_path.lower().endswith((".jpg", ".jpeg", ".png")):
-        return last_path, last_info.get("title", ""), last_info.get("uploader", "")
     return None
 
 
@@ -503,7 +519,7 @@ def download_via_cobalt(url, dest_dir):
         raise RuntimeError(f"Cobalt response unsupported: {status}")
 
     download_headers = {"User-Agent": BROWSER_USER_AGENT}
-    if COBALT_API_KEY and media_url.startswith(COBALT_API_URL):
+    if COBALT_API_KEY and urlsplit(media_url)[:2] == urlsplit(COBALT_API_URL)[:2]:
         download_headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
     with requests.get(
         media_url,
@@ -536,13 +552,13 @@ def download_via_cobalt(url, dest_dir):
 
 
 def normalize_media_url(url):
-    """پارامترهای اشتراک Instagram و نویسه‌های اضافه را حذف می‌کند."""
     clean = (url or "").strip().rstrip(".,،؛;!?)\"]}'")
-    if re.search(r"(?:instagram\.com|instagr\.am)", clean, re.I):
-        clean = clean.split("?", 1)[0]
-        if not clean.endswith("/"):
-            clean += "/"
-    return clean
+    platform = detect_platform(clean)
+    if not platform:
+        raise ValueError("Unsupported media URL")
+    parts = urlsplit(clean)
+    query = "" if platform == "instagram" else parts.query
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
 
 def _clear_download_dir(dest_dir):
@@ -567,14 +583,18 @@ def download_via_gallery_dl(url, dest_dir):
         "--quiet",
         "--directory", dest_dir,
         "--range", "1-5",
-        url,
     ]
+    if RUNTIME_COOKIES_FILE:
+        command.extend(["--cookies", RUNTIME_COOKIES_FILE])
+    if PROXY_URLS:
+        command.extend(["--proxy", random.choice(PROXY_URLS)])
+    command.extend(["--user-agent", BROWSER_USER_AGENT, url])
     completed = subprocess.run(
         command,
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        timeout=25,
+        timeout=90,
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace")[-600:]
@@ -614,6 +634,8 @@ def download_media(url, dest_dir):
             if result:
                 logger.info("دانلود موفق با موتور %s", engine_name)
                 return result
+        except InstagramRateLimitError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("موتور %s ناموفق شد: %s", engine_name, exc)
     return None
@@ -708,7 +730,7 @@ async def recognize_song(audio_path):
     if not _SHAZAM_AVAILABLE:
         return None
     try:
-        out = await Shazam().recognize(audio_path)
+        out = await asyncio.wait_for(Shazam().recognize(audio_path), RECOGNITION_TIMEOUT)
         track = out.get("track")
         if not track:
             return None
@@ -720,6 +742,12 @@ async def recognize_song(audio_path):
 
 async def _send_media_file(context, chat_id, path, caption=None):
     lower = path.lower()
+    if os.path.getsize(path) > MAX_TELEGRAM_BYTES:
+        raise ValueError("Media exceeds upload limit")
+    if lower.endswith((".jpg", ".jpeg", ".png")) and os.path.getsize(path) > MAX_PHOTO_BYTES:
+        with open(path, "rb") as fh:
+            await context.bot.send_document(chat_id, document=fh, caption=caption)
+        return
     if lower.endswith((".jpg", ".jpeg", ".png")):
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
         with open(path, "rb") as fh:
@@ -728,6 +756,9 @@ async def _send_media_file(context, chat_id, path, caption=None):
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
         with open(path, "rb") as fh:
             await context.bot.send_audio(chat_id, audio=fh, caption=caption)
+    elif lower.endswith((".mkv", ".webm")):
+        with open(path, "rb") as fh:
+            await context.bot.send_document(chat_id, document=fh, caption=caption)
     else:
         await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
         with open(path, "rb") as fh:
@@ -801,16 +832,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await require_membership(update, context, uid):
         return
+    if _music_ui and await _music_ui.start_payload(update, context):
+        return
     await update.message.reply_text(
-        f"👋 {_config.get('welcome')}\n\nیک سرویس انتخاب کنید 👇",
+        f"👋 {_config.get('welcome')}\n\n"
+        "🎵 نام آهنگ، خواننده یا بخشی از شعر را بنویسید.\n"
+        "🎙 برای شناسایی آهنگ، وویس، فایل صوتی یا ویدیو بفرستید.\n"
+        "📷 لینک اینستاگرام یا فیسبوک را هم می‌توانید بفرستید.",
         reply_markup=main_menu(),
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "کافی است لینک عمومی اینستاگرام یا فیسبوک را بفرستید.\n"
-        "ربات ویدیو، فایل MP3 و نتیجه تشخیص آهنگ را برایتان ارسال می‌کند."
+        "🎵 نام آهنگ، خواننده یا بخشی از شعر را بنویسید و از نتایج انتخاب کنید.\n"
+        "🎙 برای شناسایی، وویس یا ویدیوی کوتاه و واضح بفرستید.\n"
+        "📷 لینک عمومی اینستاگرام یا فیسبوک نیز پذیرفته می‌شود.\n"
+        "/search — جستجوی آهنگ\n/favorites — علاقه‌مندی‌ها\n"
+        "/recent — آهنگ‌های اخیر\n/forget — پاک کردن تاریخچه و علاقه‌مندی‌ها\n"
+        "جستجوی متن ترانه، صفحهٔ جستجوی بیرونی را باز می‌کند."
     )
 
 
@@ -846,9 +886,22 @@ async def on_menu_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def detect_platform(text):
-    for name, pat in PLATFORM_PATTERNS.items():
-        if pat.search(text):
-            return name
+    try:
+        parts = urlsplit(text)
+        if parts.scheme.lower() not in ("http", "https") or parts.username or parts.password:
+            return None
+        if parts.port not in (None, 80, 443):
+            return None
+        host = (parts.hostname or "").lower().rstrip(".")
+    except (ValueError, TypeError):
+        return None
+    domains = {
+        "instagram": ("instagram.com", "instagr.am"),
+        "facebook": ("facebook.com", "fb.watch", "fb.com"),
+    }
+    for platform, allowed in domains.items():
+        if any(host == domain or host.endswith("." + domain) for domain in allowed):
+            return platform
     return None
 
 
@@ -875,20 +928,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url_match = URL_RE.search(text)
 
     if url_match:
-        platform = detect_platform(text) or mode
+        platform = detect_platform(url_match.group(0))
         if platform in _config["services"] and not _config["services"][platform]:
             await update.message.reply_text("این سرویس موقتاً غیرفعال است.")
             return
         await _do_video_download(update, context, url_match.group(0))
         return
 
-    if mode in ("instagram", "facebook"):
-        await update.message.reply_text("❌ لطفاً یک لینک معتبر بفرستید.")
-    else:
-        await update.message.reply_text(
-            "لطفاً اول با /start یک سرویس انتخاب کنید یا یک لینک بفرستید.",
-            reply_markup=main_menu(),
-        )
+    if _music_ui:
+        await _music_ui.search(update, context, text)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -906,11 +954,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _acquire_job(update, uid):
         return
 
-    status = await update.message.reply_text("🎧 در حال شنیدن و تشخیص آهنگ...")
-    tmpdir = tempfile.mkdtemp(prefix="recognize_")
+    status = None
+    tmpdir = None
     try:
+        status = await update.message.reply_text("🎧 در حال شنیدن و تشخیص آهنگ...")
+        tmpdir = tempfile.mkdtemp(prefix="recognize_")
         msg = update.message
-        media = msg.voice or msg.audio or msg.video or msg.video_note
+        media = msg.voice or msg.audio or msg.video or msg.video_note or msg.document
         if not media:
             await status.edit_text("❌ فایل قابل پردازشی پیدا نشد.")
             return
@@ -920,6 +970,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = (metadata_title, metadata_artist)
             logger.info("نام آهنگ از metadata تلگرام دریافت شد")
         else:
+            if media.file_size and media.file_size > 20 * 1024 * 1024:
+                await status.edit_text("❌ برای تشخیص آهنگ، یک نمونه کمتر از ۲۰ مگابایت بفرستید.")
+                return
             tg_file = await media.get_file()
             source = os.path.join(tmpdir, "sample")
             await tg_file.download_to_drive(source)
@@ -943,9 +996,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as exc:
         logger.exception("خطا در تشخیص فایل کاربر: %s", exc)
-        await status.edit_text("❌ پردازش فایل ناموفق بود؛ دوباره تلاش کنید.")
+        if status:
+            await status.edit_text("❌ پردازش فایل ناموفق بود؛ دوباره تلاش کنید.")
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         _user_busy.discard(uid)
 
 
@@ -965,12 +1020,14 @@ async def _do_video_download(update, context, url):
     if not await _acquire_job(update, uid):
         return
 
-    chat_id = update.effective_chat.id
-    status = await update.message.reply_text(
-        f"⏳ لینک {SERVICE_LABELS[platform]} دریافت شد؛ در حال آماده‌سازی رسانه..."
-    )
-    tmpdir = tempfile.mkdtemp(prefix=f"{platform}_")
+    status = None
+    tmpdir = None
     try:
+        chat_id = update.effective_chat.id
+        status = await update.message.reply_text(
+            f"⏳ لینک {SERVICE_LABELS[platform]} دریافت شد؛ در حال آماده‌سازی رسانه..."
+        )
+        tmpdir = tempfile.mkdtemp(prefix=f"{platform}_")
         loop = asyncio.get_running_loop()
         async with _limiter:
             await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_VIDEO)
@@ -993,10 +1050,14 @@ async def _do_video_download(update, context, url):
             full_song = None
             if path.lower().endswith((".mp4", ".mkv", ".webm")):
                 audio_path = await loop.run_in_executor(
-                    None, extract_audio_track, path, tmpdir
+                    None, prepare_recognition_sample, path, tmpdir
                 )
                 if audio_path:
                     song = await recognize_song(audio_path)
+                if FULL_SONG_DOWNLOAD and song and song[0]:
+                    full_song = await loop.run_in_executor(
+                        None, download_full_song, song[0], song[1], tmpdir
+                    )
 
         if full_song:
             song_path, found_title, found_artist = full_song
@@ -1041,7 +1102,8 @@ async def _do_video_download(update, context, url):
         except Exception:
             pass
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         _user_busy.discard(uid)
 
 
@@ -1308,6 +1370,10 @@ async def _post_init(app):
     public = [
         BotCommand("start", "شروع / منوی اصلی"),
         BotCommand("help", "راهنما"),
+        BotCommand("search", "جستجوی آهنگ"),
+        BotCommand("favorites", "آهنگ‌های موردعلاقه"),
+        BotCommand("recent", "آهنگ‌های اخیر"),
+        BotCommand("forget", "پاک کردن تاریخچهٔ آهنگ‌ها"),
         BotCommand("id", "نمایش آی‌دی عددی من"),
     ]
     await app.bot.set_my_commands(public, scope=BotCommandScopeDefault())
@@ -1321,16 +1387,26 @@ async def _post_init(app):
 
 
 def main():
+    global _music_ui
     if not BOT_TOKEN:
         raise SystemExit("متغیر محیطی BOT_TOKEN تنظیم نشده است.")
 
     load_state()
+    _music_ui = MusicUI(
+        DATA_DIR, BOT_TOKEN.split(":", 1)[0], lambda: _config,
+        _acquire_job, _user_busy.discard, _limiter, require_membership, is_admin,
+    )
     logger.info("ادمین‌ها: %s | کاربران ذخیره‌شده: %d", ADMIN_IDS or "—", len(_users))
 
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .concurrent_updates(True)
+        .concurrent_updates(32)
+        .update_queue(asyncio.Queue(maxsize=256))
+        .connect_timeout(15)
+        .read_timeout(60)
+        .write_timeout(120)
+        .pool_timeout(30)
         .post_init(_post_init)
         .build()
     )
@@ -1339,13 +1415,14 @@ def main():
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("cancel", cancel))
+    _music_ui.register(app)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(on_menu_back, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(on_checkjoin, pattern=r"^checkjoin$"))
     app.add_handler(CallbackQueryHandler(on_admin, pattern=r"^adm:"))
     app.add_handler(
         MessageHandler(
-            filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE,
+            filters.VOICE | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.AUDIO | filters.Document.VIDEO,
             handle_audio,
         )
     )
@@ -1354,13 +1431,7 @@ def main():
 
     if WEBHOOK_URL:
         logger.info("اجرا در حالت webhook روی پورت %s", PORT)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-            drop_pending_updates=True,
-        )
+        asyncio.run(serve(app, BOT_TOKEN, WEBHOOK_URL, PORT))
     else:
         logger.info("اجرا در حالت polling")
         app.run_polling(drop_pending_updates=True)

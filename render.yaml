@@ -5,6 +5,7 @@ services:
     dockerfilePath: ./Dockerfile
     region: oregon
     plan: free
+    healthCheckPath: /healthz
     envVars:
       # توکن را در داشبورد Render وارد کنید (Environment → Add Environment Variable)
       - key: BOT_TOKEN
