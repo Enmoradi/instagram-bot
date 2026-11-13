@@ -102,6 +102,10 @@ class InstagramRateLimitError(RuntimeError):
     """Instagram IP/session rate limit (HTTP 429)."""
 
 
+class InstagramAuthenticationError(RuntimeError):
+    """Instagram refused anonymous or expired-session access."""
+
+
 def _prepare_cookie_file():
     """Cookie Netscape را از env رمزگذاری‌شده روی دیسک موقت می‌سازد."""
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
@@ -128,6 +132,33 @@ def _prepare_cookie_file():
 
 
 RUNTIME_COOKIES_FILE = _prepare_cookie_file()
+
+
+def _instagram_auth_status():
+    """Return a secret-free summary suitable for logs and the owner panel."""
+    if not RUNTIME_COOKIES_FILE or not os.path.exists(RUNTIME_COOKIES_FILE):
+        return "missing"
+    try:
+        with open(RUNTIME_COOKIES_FILE, encoding="utf-8") as handle:
+            text = handle.read().lower()
+    except OSError:
+        return "unreadable"
+    if "instagram.com" not in text or "sessionid" not in text:
+        return "incomplete"
+    return "configured"
+
+
+def _looks_like_instagram_access_block(error):
+    text = str(error).lower()
+    markers = (
+        "redirected to the login page",
+        "http redirect to login page",
+        "accounts/login",
+        "rate-limit",
+        "http error 429",
+        "error.api.fetch.empty",
+    )
+    return any(marker in text for marker in markers)
 
 # ---- ضداسپم و پایداری ----
 # تعداد تلاش مجدد روی خطای موقت شبکه
@@ -479,9 +510,9 @@ def download_video(url, dest_dir):
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
                 logger.warning("دانلود (cap=%s تلاش=%s) ناموفق: %s", cap, attempt, message)
-                if "HTTP Error 429" in message or "rate-limit" in message.lower():
+                if _looks_like_instagram_access_block(message):
                     # تکرار کیفیت‌های دیگر روی همان IP فقط محدودیت را شدیدتر می‌کند.
-                    raise InstagramRateLimitError(message) from exc
+                    raise InstagramAuthenticationError(message) from exc
                 if attempt < retries:
                     time.sleep(min(8, 2 ** attempt))
         if info is None:
@@ -544,8 +575,20 @@ def download_via_cobalt(url, dest_dir):
         headers=headers,
         timeout=(10, max(30, min(180, int(_config.get("media_timeout", 90))))),
     )
-    response.raise_for_status()
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        response.raise_for_status()
+        raise RuntimeError("Cobalt returned a non-JSON response") from exc
+    if not response.ok:
+        error = data.get("error") or {}
+        code = error.get("code") or "request failed"
+        context = error.get("context") or {}
+        service = context.get("service")
+        detail = f"Cobalt HTTP {response.status_code}: {code}"
+        if service:
+            detail += f" ({service})"
+        raise RuntimeError(detail)
     status = data.get("status")
 
     media_url = None
@@ -646,6 +689,8 @@ def download_via_gallery_dl(url, dest_dir):
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace")[-600:]
+        if _looks_like_instagram_access_block(detail):
+            raise InstagramAuthenticationError(detail)
         raise RuntimeError(f"gallery-dl exited {completed.returncode}: {detail}")
 
     candidates = []
@@ -681,6 +726,7 @@ def download_media(url, dest_dir):
     if not engines:
         raise RuntimeError("All media engines are disabled")
 
+    failures = []
     for engine_name, engine in engines:
         _clear_download_dir(dest_dir)
         try:
@@ -688,15 +734,28 @@ def download_media(url, dest_dir):
             if result:
                 logger.info("دانلود موفق با موتور %s", engine_name)
                 return result
-        except InstagramRateLimitError:
+        except (InstagramRateLimitError, InstagramAuthenticationError) as exc:
             # yt-dlp/gallery share this server IP, while Cobalt is an independent
             # service. A 429 from one engine must not suppress independent fallbacks.
-            report_error(engine_name, "Instagram rate limit (trying next engine)")
-            logger.warning("موتور %s با 429 محدود شد؛ موتور مستقل بعدی امتحان می‌شود", engine_name)
+            failures.append((engine_name, exc))
+            report_error(engine_name, "Instagram access blocked (trying next engine)")
+            logger.warning("دسترسی Instagram برای موتور %s رد شد؛ موتور مستقل بعدی امتحان می‌شود", engine_name)
             continue
         except Exception as exc:  # noqa: BLE001
+            failures.append((engine_name, exc))
             logger.warning("موتور %s ناموفق شد: %s", engine_name, exc)
             report_error(engine_name, exc)
+    if detect_platform(clean_url) == "instagram" and any(
+        _looks_like_instagram_access_block(error) for _, error in failures
+    ):
+        auth = _instagram_auth_status()
+        if auth == "configured":
+            raise InstagramAuthenticationError(
+                "Instagram rejected the configured session; refresh INSTAGRAM_COOKIES_B64"
+            )
+        raise InstagramAuthenticationError(
+            f"Instagram authentication required; cookie status={auth}"
+        )
     return None
 
 
@@ -1167,11 +1226,26 @@ async def _do_video_download(update, context, url):
             reply_markup=_music_search_kb(song[0], song[1])
             if song and song[0] else _back_menu_kb(),
         )
-    except InstagramRateLimitError:
-        logger.warning("Instagram درخواست این IP را با 429 محدود کرد")
-        report_error("instagram", "IP rate limited (429)")
+    except (InstagramRateLimitError, InstagramAuthenticationError) as exc:
+        logger.warning("Instagram دسترسی بدون نشست معتبر را رد کرد: %s", exc)
+        report_error("instagram-auth", exc)
+        if is_admin(uid):
+            auth = _instagram_auth_status()
+            if auth == "configured":
+                message = (
+                    "❌ نشست Instagram موجود است اما پذیرفته نشد. Cookie منقضی شده؛ "
+                    "یک Cookie تازه با sessionid را در INSTAGRAM_COOKIES_B64 جایگزین کنید."
+                )
+            else:
+                message = (
+                    "❌ Instagram دانلود ناشناس این سرور را مسدود کرده است. "
+                    "برای فعال‌شدن دانلود، Cookie معتبر Netscape را به‌صورت Base64 در "
+                    "INSTAGRAM_COOKIES_B64 هاست وارد کنید."
+                )
+        else:
+            message = "❌ Instagram این رسانه را بدون ورود اجازه نمی‌دهد. مدیر ربات در حال رفع دسترسی است."
         await status.edit_text(
-            "❌ در حال حاضر دریافت این رسانه ممکن نشد. لطفاً کمی بعد دوباره تلاش کنید.",
+            message,
             reply_markup=_back_menu_kb(),
         )
     except Exception as exc:
@@ -1241,6 +1315,7 @@ def admin_panel():
     rows = [
         [InlineKeyboardButton("📊 وضعیت زنده", callback_data="adm:stats"),
          InlineKeyboardButton("🧾 خطاهای اخیر", callback_data="adm:errors")],
+        [InlineKeyboardButton("🔐 وضعیت دسترسی منابع", callback_data="adm:access")],
         [InlineKeyboardButton("🧩 سرویس‌ها", callback_data="adm:services"),
          InlineKeyboardButton("🔌 موتورهای دانلود", callback_data="adm:engines")],
         [InlineKeyboardButton("⚡ کارایی و صف", callback_data="adm:settings:performance"),
@@ -1355,6 +1430,31 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🧩 سرویس‌ها:\n"
             f"  اینستاگرام {_onoff(svc['instagram'])}  فیسبوک {_onoff(svc['facebook'])}\n"
             "  🎵 استخراج و تشخیص موسیقی: خودکار برای هر ویدیو\n"
+        )
+        await query.edit_message_text(
+            txt, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")]]),
+        )
+
+    elif data == "access":
+        await query.answer()
+        auth = _instagram_auth_status()
+        auth_labels = {
+            "configured": "🟢 Cookie دارای sessionid",
+            "missing": "🔴 Cookie تنظیم نشده",
+            "incomplete": "🟠 Cookie ناقص یا بدون sessionid",
+            "unreadable": "🔴 فایل Cookie خوانده نمی‌شود",
+        }
+        txt = (
+            "🔐 *وضعیت دسترسی منابع*\n\n"
+            f"Instagram: {auth_labels.get(auth, auth)}\n"
+            f"Proxyهای مستقیم: {len(PROXY_URLS)}\n"
+            f"Cobalt مستقل: {'🟢 تنظیم شده' if COBALT_API_URL else '🔴 تنظیم نشده'}\n"
+            f"کلید Cobalt: {'🟢 تنظیم شده' if COBALT_API_KEY else '⚪️ لازم نیست/تنظیم نشده'}\n\n"
+            "برای Instagram، Cookie باید با فرمت Netscape، شامل sessionid معتبر، "
+            "به‌صورت Base64 فقط در متغیر امن INSTAGRAM_COOKIES_B64 هاست ثبت شود. "
+            "مقدار محرمانه هرگز در این پنل نمایش داده نمی‌شود."
         )
         await query.edit_message_text(
             txt, parse_mode="Markdown",
