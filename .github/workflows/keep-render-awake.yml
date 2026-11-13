@@ -2,8 +2,9 @@ name: Keep Render bot awake
 
 on:
   schedule:
-    # Offset from the top of the hour to reduce GitHub scheduler congestion.
-    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+    # External fallback stays below Render's 15-minute inactivity window.
+    # Editing this schedule also re-registers it after long repository inactivity.
+    - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch:
 
 permissions:

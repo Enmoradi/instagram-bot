@@ -5,8 +5,10 @@ import hmac
 import json
 import os
 import signal
+import time
 
 from telegram import Update
+from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 import tornado.httpserver
 import tornado.web
 
@@ -18,8 +20,15 @@ class HealthHandler(tornado.web.RequestHandler):
     def get(self):
         self.set_status(200 if self.state['ready'] else 503)
         self.set_header('Cache-Control', 'no-store')
-        self.write({'status': 'ok' if self.state['ready'] else 'starting',
-                    'service': 'music-bot', 'revision': os.environ.get('RENDER_GIT_COMMIT', 'local')[:12]})
+        queue = self.state.get('queue')
+        self.write({
+            'status': 'ok' if self.state['ready'] else 'starting',
+            'service': 'music-bot',
+            'revision': os.environ.get('RENDER_GIT_COMMIT', 'local')[:12],
+            'uptime_seconds': max(0, int(time.monotonic() - self.state['started_at'])),
+            'queue': queue.qsize() if queue is not None else 0,
+            'keepalive': self.state.get('keepalive', 'disabled'),
+        })
 
 
 class TelegramHandler(tornado.web.RequestHandler):
@@ -54,6 +63,29 @@ def routes(application, secret, state):
     ])
 
 
+async def _self_keepalive(url, state, interval):
+    """Keep a free web service active without blocking Telegram updates."""
+    client = AsyncHTTPClient()
+    endpoint = url.rstrip('/') + '/healthz'
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            response = await client.fetch(HTTPRequest(
+                endpoint,
+                method='GET',
+                request_timeout=30,
+                connect_timeout=15,
+                headers={'User-Agent': 'media-bot-self-keepalive/1.0'},
+            ))
+            state['keepalive'] = 'ok' if response.code == 200 else 'degraded'
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # GitHub monitoring remains the fallback. A failed self-ping must
+            # never crash the bot or interrupt its Telegram webhook.
+            state['keepalive'] = 'degraded'
+
+
 async def serve(application, token, url, port):
     stopped = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -63,9 +95,15 @@ async def serve(application, token, url, port):
         except (NotImplementedError, RuntimeError):
             pass
     secret = hashlib.sha256(('telegram-webhook:' + token).encode()).hexdigest()
-    state = {'ready': False}
+    state = {
+        'ready': False,
+        'started_at': time.monotonic(),
+        'queue': application.update_queue,
+        'keepalive': 'starting',
+    }
     server = tornado.httpserver.HTTPServer(routes(application, secret, state), max_body_size=1024 * 1024)
     server.listen(port, address='0.0.0.0')
+    keepalive_task = None
     try:
         async with application:
             if application.post_init:
@@ -77,9 +115,16 @@ async def serve(application, token, url, port):
                     allowed_updates=Update.ALL_TYPES, drop_pending_updates=False,
                 )
                 state['ready'] = True
+                interval = max(60, int(os.environ.get('SELF_KEEPALIVE_INTERVAL_SECONDS', '480')))
+                keepalive_task = asyncio.create_task(
+                    _self_keepalive(url, state, interval), name='self-keepalive'
+                )
                 await stopped.wait()
             finally:
                 state['ready'] = False
+                if keepalive_task:
+                    keepalive_task.cancel()
+                    await asyncio.gather(keepalive_task, return_exceptions=True)
                 server.stop()
                 await application.stop()
     finally:
