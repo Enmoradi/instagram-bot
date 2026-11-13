@@ -29,6 +29,8 @@ class MusicStore:
     def connection(self):
         db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
+        db.execute('PRAGMA busy_timeout=5000')
+        db.execute('PRAGMA foreign_keys=ON')
         try:
             with db:
                 yield db

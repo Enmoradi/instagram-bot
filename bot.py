@@ -27,7 +27,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -60,6 +60,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("media-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+STARTED_AT = time.monotonic()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = (
@@ -859,6 +860,28 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     parse_mode="Markdown")
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Operational status for owners without exposing secrets to regular users."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.effective_message.reply_text("⛔️ دسترسی ندارید.")
+        return
+    uptime = max(0, int(time.monotonic() - STARTED_AT))
+    hours, remainder = divmod(uptime, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    revision = os.environ.get("RENDER_GIT_COMMIT", "local")[:12]
+    queue = context.application.update_queue
+    await update.effective_message.reply_text(
+        "🟢 وضعیت ربات: فعال\n"
+        f"⏱ زمان فعالیت: {hours:02}:{minutes:02}:{seconds:02}\n"
+        f"📥 صف آپدیت‌ها: {queue.qsize()}/{queue.maxsize}\n"
+        f"⚙️ کارهای فعال: {len(_user_busy)}/{MAX_PENDING_JOBS}\n"
+        f"👥 کاربران ثبت‌شده: {len(_users)}\n"
+        f"🔖 نسخه: {revision}\n"
+        f"🚧 حالت تعمیر: {'روشن' if _config.get('maintenance') else 'خاموش'}"
+    )
+
+
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     uid = query.from_user.id
@@ -870,7 +893,6 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("این سرویس موقتاً غیرفعال است.", show_alert=True)
         return
     if not await require_membership(update, context, uid):
-        await query.answer()
         return
     await query.answer()
     context.user_data["mode"] = mode
@@ -1359,7 +1381,21 @@ async def _broadcast(update, context, text):
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("خطا هنگام پردازش آپدیت:", exc_info=context.error)
+    error = context.error
+    update_id = getattr(update, "update_id", "unknown")
+    if isinstance(error, RetryAfter):
+        logger.warning("محدودیت تلگرام برای آپدیت %s؛ تلاش مجدد پس از %s ثانیه", update_id, error.retry_after)
+    elif isinstance(error, (TimedOut, NetworkError)):
+        logger.warning("خطای موقت شبکه برای آپدیت %s: %s", update_id, error)
+    else:
+        logger.error("خطای پردازش آپدیت %s:", update_id, exc_info=error)
+
+    message = getattr(update, "effective_message", None)
+    if message:
+        try:
+            await message.reply_text("⚠️ پردازش این درخواست کامل نشد. لطفاً چند لحظه بعد دوباره تلاش کنید.")
+        except TelegramError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1376,9 +1412,15 @@ async def _post_init(app):
         BotCommand("forget", "پاک کردن تاریخچهٔ آهنگ‌ها"),
         BotCommand("id", "نمایش آی‌دی عددی من"),
     ]
-    await app.bot.set_my_commands(public, scope=BotCommandScopeDefault())
+    try:
+        await app.bot.set_my_commands(public, scope=BotCommandScopeDefault())
+    except TelegramError as exc:
+        logger.warning("تنظیم دستورهای عمومی ناموفق بود؛ ربات به کار ادامه می‌دهد: %s", exc)
     # دستورهای ادمین (شامل /admin) فقط برای ادمین‌ها نمایش داده می‌شود
-    admin_cmds = public + [BotCommand("admin", "پنل مدیریت")]
+    admin_cmds = public + [
+        BotCommand("admin", "پنل مدیریت"),
+        BotCommand("status", "وضعیت فنی ربات"),
+    ]
     for aid in ADMIN_IDS:
         try:
             await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(aid))
@@ -1414,6 +1456,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", myid))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("cancel", cancel))
     _music_ui.register(app)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^mode:"))
