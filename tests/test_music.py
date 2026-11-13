@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from music_store import MusicStore
 from music_ui import MusicUI, run_worker
@@ -58,6 +58,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.busy = set()
+        self.config = {}
+        self.reporter = Mock()
 
         async def acquire(update, uid):
             if uid in self.busy:
@@ -65,8 +67,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             self.busy.add(uid)
             return True
 
-        self.ui = MusicUI(self.tmp.name, '123', lambda: {}, acquire, self.busy.discard,
-                          asyncio.Semaphore(2), AsyncMock(return_value=True), lambda uid: False)
+        self.ui = MusicUI(self.tmp.name, '123', lambda: self.config, acquire, self.busy.discard,
+                          asyncio.Semaphore(2), AsyncMock(return_value=True), lambda uid: False,
+                          self.reporter)
         self.message = SimpleNamespace(reply_text=AsyncMock())
         self.update = SimpleNamespace(effective_user=SimpleNamespace(id=1),
             effective_message=self.message, effective_chat=SimpleNamespace(id=1, type='private'), callback_query=None)
@@ -78,6 +81,16 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         second = await self.ui.search_tracks('song artist')
         self.assertEqual(first, second)
         self.ui.worker.assert_awaited_once()
+
+    async def test_worker_receives_live_admin_settings(self):
+        self.config.update({'music_workers': 4, 'music_max_minutes': 90,
+                            'music_search_results': 8, 'music_search_timeout': 55})
+        with patch('music_ui.run_worker', AsyncMock(return_value=[])) as worker:
+            await self.ui.worker('search', 'Song')
+        settings = worker.call_args.kwargs['settings']
+        self.assertEqual(settings['MUSIC_MAX_MINUTES'], 90)
+        self.assertEqual(settings['MUSIC_SEARCH_RESULTS'], 8)
+        self.assertEqual(settings['MUSIC_SEARCH_TIMEOUT'], 55)
 
     async def test_search_releases_slot_if_status_fails(self):
         self.message.reply_text.side_effect = RuntimeError('network')
@@ -101,6 +114,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         await self.ui.download(self.update, self.context, key)
         self.assertEqual(self.busy, set())
         self.context.bot.send_audio.assert_not_called()
+        self.reporter.assert_called_once()
+        self.assertIn('YouTube Music', str(self.message.reply_text.return_value.edit_text.call_args))
 
     async def test_recognition_button_searches_before_downloading(self):
         keyboard = self.ui.recognition_keyboard('Song', 'Artist')

@@ -7,6 +7,7 @@
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections import deque
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 from telegram import (
@@ -174,7 +176,8 @@ async def _acquire_job(update, uid):
     if uid in _user_busy:
         await update.effective_message.reply_text("⏳ درخواست قبلی شما هنوز در حال پردازش است.")
         return False
-    if len(_user_busy) >= MAX_PENDING_JOBS:
+    pending_cap = max(1, min(200, int(_config.get("max_pending_jobs", MAX_PENDING_JOBS))))
+    if len(_user_busy) >= pending_cap:
         await update.effective_message.reply_text("⏳ ظرفیت ربات تکمیل است؛ کمی بعد دوباره تلاش کنید.")
         return False
     if _config.get("user_limits") and not is_admin(uid) and _rate_limited(uid):
@@ -222,13 +225,51 @@ DEFAULT_CONFIG = {
     "user_limits": os.environ.get("USER_LIMITS", "false").lower() == "true",
     "rate_per_min": int(os.environ.get("RATE_LIMIT_PER_MIN", "15")),
     "max_concurrent": int(os.environ.get("MAX_CONCURRENT", "6")),
+    "max_pending_jobs": int(os.environ.get("MAX_PENDING_JOBS", "32")),
+    "max_upload_mb": 49,
+    "video_quality": 720,
+    "media_timeout": 90,
+    "download_retries": DOWNLOAD_RETRIES,
+    "music_max_minutes": 60,
+    "music_workers": 3,
+    "music_search_results": 5,
+    "music_search_timeout": 35,
+    "music_download_timeout": 240,
+    "music_bitrate": 128,
+    "engines": {
+        "media_ytdlp": True,
+        "media_cobalt": True,
+        "media_gallery": True,
+        "music_youtube": True,
+        "music_cobalt": True,
+        "music_soundcloud": True,
+    },
 }
 
 # ---------------------------------------------------------------------------
 # ذخیره‌سازی تنظیمات و کاربران
 # ---------------------------------------------------------------------------
-_config = dict(DEFAULT_CONFIG)
+_config = copy.deepcopy(DEFAULT_CONFIG)
 _users = set()
+_recent_errors = deque(maxlen=20)
+
+
+def report_error(category, error):
+    """Keep a small, secret-free diagnostic feed for the owner panel."""
+    message = " ".join(str(error).replace("\n", " ").split())
+    for secret in (BOT_TOKEN, COBALT_API_KEY):
+        if secret:
+            message = message.replace(secret, "[secret]")
+    _recent_errors.appendleft({
+        "time": time.strftime("%H:%M:%S", time.gmtime()),
+        "category": str(category)[:30],
+        "message": message[:220] or type(error).__name__,
+    })
+
+
+def _max_upload_bytes():
+    # Telegram's public Bot API hard limit cannot be raised by an admin setting.
+    return max(5, min(49, int(_config.get("max_upload_mb", 49)))) * 1024 * 1024
 
 
 def _atomic_write(path, data):
@@ -245,7 +286,7 @@ def load_state():
     try:
         with open(CONFIG_PATH, encoding="utf-8") as fh:
             saved = json.load(fh)
-        merged = dict(DEFAULT_CONFIG)
+        merged = copy.deepcopy(DEFAULT_CONFIG)
         merged.update(saved)
         # اطمینان از وجود همه‌ی کلیدهای services
         # فقط سرویس‌های پشتیبانی‌شده را از تنظیمات قدیمی نگه می‌داریم.
@@ -253,6 +294,11 @@ def load_state():
         merged["services"] = {
             key: bool(saved_services.get(key, enabled))
             for key, enabled in DEFAULT_CONFIG["services"].items()
+        }
+        saved_engines = saved.get("engines", {})
+        merged["engines"] = {
+            key: bool(saved_engines.get(key, enabled))
+            for key, enabled in DEFAULT_CONFIG["engines"].items()
         }
         _config = merged
     except FileNotFoundError:
@@ -385,12 +431,12 @@ def _base_ydl_opts(dest_dir):
         "no_warnings": True,
         "noplaylist": True,
         "js_runtimes": {"node": {}},
-        "max_filesize": MAX_TELEGRAM_BYTES,
+        "max_filesize": _max_upload_bytes(),
         "playlistend": 1,
         "restrictfilenames": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
+        "retries": max(1, min(5, int(_config.get("download_retries", DOWNLOAD_RETRIES)))),
+        "fragment_retries": max(1, min(5, int(_config.get("download_retries", DOWNLOAD_RETRIES)))),
+        "socket_timeout": max(10, min(120, int(_config.get("media_timeout", 90)))),
         "sleep_interval": 1,
         "max_sleep_interval": 3,
         "http_headers": {
@@ -409,7 +455,7 @@ def download_video(url, dest_dir):
     """فقط یک نسخه معمولی تا 720p را دانلود می‌کند."""
     last_path = None
     last_info = {}
-    for cap in HEIGHT_CAPS:
+    for cap in [max(240, min(1080, int(_config.get("video_quality", 720))))]:
         for f in os.listdir(dest_dir):
             try:
                 os.remove(os.path.join(dest_dir, f))
@@ -424,7 +470,8 @@ def download_video(url, dest_dir):
         opts["merge_output_format"] = "mp4"
 
         info = None
-        for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        retries = max(1, min(5, int(_config.get("download_retries", DOWNLOAD_RETRIES))))
+        for attempt in range(1, retries + 1):
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -435,7 +482,7 @@ def download_video(url, dest_dir):
                 if "HTTP Error 429" in message or "rate-limit" in message.lower():
                     # تکرار کیفیت‌های دیگر روی همان IP فقط محدودیت را شدیدتر می‌کند.
                     raise InstagramRateLimitError(message) from exc
-                if attempt < DOWNLOAD_RETRIES:
+                if attempt < retries:
                     time.sleep(min(8, 2 ** attempt))
         if info is None:
             continue
@@ -449,7 +496,7 @@ def download_video(url, dest_dir):
         if not files:
             continue
         last_path = max(files, key=os.path.getsize)
-        if 0 < os.path.getsize(last_path) <= MAX_TELEGRAM_BYTES:
+        if 0 < os.path.getsize(last_path) <= _max_upload_bytes():
             title = last_info.get("title") or ""
             source = last_info.get("uploader") or last_info.get("extractor_key") or ""
             return last_path, title, source
@@ -495,7 +542,7 @@ def download_via_cobalt(url, dest_dir):
         f"{COBALT_API_URL}/",
         json=payload,
         headers=headers,
-        timeout=(10, 70),
+        timeout=(10, max(30, min(180, int(_config.get("media_timeout", 90))))),
     )
     response.raise_for_status()
     data = response.json()
@@ -527,11 +574,11 @@ def download_via_cobalt(url, dest_dir):
         headers=download_headers,
         stream=True,
         allow_redirects=True,
-        timeout=(10, 75),
+        timeout=(10, max(30, min(180, int(_config.get("media_timeout", 90))))),
     ) as media:
         media.raise_for_status()
         declared = int(media.headers.get("Content-Length") or 0)
-        if declared > MAX_TELEGRAM_BYTES:
+        if declared > _max_upload_bytes():
             raise RuntimeError("Cobalt media is larger than Telegram limit")
         ext = _cobalt_extension(filename, media.headers.get("Content-Type"))
         path = os.path.join(dest_dir, f"cobalt_media{ext}")
@@ -541,7 +588,7 @@ def download_via_cobalt(url, dest_dir):
                 if not chunk:
                     continue
                 size += len(chunk)
-                if size > MAX_TELEGRAM_BYTES:
+                if size > _max_upload_bytes():
                     raise RuntimeError("Cobalt media exceeded Telegram limit")
                 handle.write(chunk)
 
@@ -595,7 +642,7 @@ def download_via_gallery_dl(url, dest_dir):
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        timeout=90,
+        timeout=max(30, min(180, int(_config.get("media_timeout", 90)))),
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace")[-600:]
@@ -606,7 +653,7 @@ def download_via_gallery_dl(url, dest_dir):
         for name in files:
             path = os.path.join(root, name)
             if name.lower().endswith((".mp4", ".webm", ".mkv", ".jpg", ".jpeg", ".png")):
-                if 0 < os.path.getsize(path) <= MAX_TELEGRAM_BYTES:
+                if 0 < os.path.getsize(path) <= _max_upload_bytes():
                     candidates.append(path)
     if not candidates:
         return None
@@ -623,10 +670,16 @@ def download_via_gallery_dl(url, dest_dir):
 def download_media(url, dest_dir):
     """سه موتور مستقل را به‌ترتیب امتحان می‌کند و فقط نتیجه را برمی‌گرداند."""
     clean_url = normalize_media_url(url)
-    engines = [("yt-dlp", download_video)]
-    if COBALT_API_URL:
+    enabled = _config.get("engines", {})
+    engines = []
+    if enabled.get("media_ytdlp", True):
+        engines.append(("yt-dlp", download_video))
+    if COBALT_API_URL and enabled.get("media_cobalt", True):
         engines.append(("cobalt", download_via_cobalt))
-    engines.append(("gallery-dl", download_via_gallery_dl))
+    if enabled.get("media_gallery", True):
+        engines.append(("gallery-dl", download_via_gallery_dl))
+    if not engines:
+        raise RuntimeError("All media engines are disabled")
 
     for engine_name, engine in engines:
         _clear_download_dir(dest_dir)
@@ -636,9 +689,14 @@ def download_media(url, dest_dir):
                 logger.info("دانلود موفق با موتور %s", engine_name)
                 return result
         except InstagramRateLimitError:
-            raise
+            # yt-dlp/gallery share this server IP, while Cobalt is an independent
+            # service. A 429 from one engine must not suppress independent fallbacks.
+            report_error(engine_name, "Instagram rate limit (trying next engine)")
+            logger.warning("موتور %s با 429 محدود شد؛ موتور مستقل بعدی امتحان می‌شود", engine_name)
+            continue
         except Exception as exc:  # noqa: BLE001
             logger.warning("موتور %s ناموفق شد: %s", engine_name, exc)
+            report_error(engine_name, exc)
     return None
 
 
@@ -657,7 +715,7 @@ def extract_audio_track(media_path, dest_dir):
         if completed.returncode != 0 or not os.path.exists(output):
             logger.warning("استخراج صدا ناموفق بود: %s", completed.stderr[-500:])
             return None
-        if os.path.getsize(output) <= 0 or os.path.getsize(output) > MAX_TELEGRAM_BYTES:
+        if os.path.getsize(output) <= 0 or os.path.getsize(output) > _max_upload_bytes():
             return None
         return output
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -694,7 +752,7 @@ def download_full_song(title, artist, dest_dir):
         if not candidates:
             return None
         path = max(candidates, key=os.path.getsize)
-        if os.path.getsize(path) <= 0 or os.path.getsize(path) > MAX_TELEGRAM_BYTES:
+        if os.path.getsize(path) <= 0 or os.path.getsize(path) > _max_upload_bytes():
             return None
         found_title = (info or {}).get("track") or (info or {}).get("title") or title
         found_artist = (info or {}).get("artist") or (info or {}).get("uploader") or artist
@@ -743,7 +801,7 @@ async def recognize_song(audio_path):
 
 async def _send_media_file(context, chat_id, path, caption=None):
     lower = path.lower()
-    if os.path.getsize(path) > MAX_TELEGRAM_BYTES:
+    if os.path.getsize(path) > _max_upload_bytes():
         raise ValueError("Media exceeds upload limit")
     if lower.endswith((".jpg", ".jpeg", ".png")) and os.path.getsize(path) > MAX_PHOTO_BYTES:
         with open(path, "rb") as fh:
@@ -875,7 +933,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🟢 وضعیت ربات: فعال\n"
         f"⏱ زمان فعالیت: {hours:02}:{minutes:02}:{seconds:02}\n"
         f"📥 صف آپدیت‌ها: {queue.qsize()}/{queue.maxsize}\n"
-        f"⚙️ کارهای فعال: {len(_user_busy)}/{MAX_PENDING_JOBS}\n"
+        f"⚙️ کارهای فعال: {len(_user_busy)}/{_config.get('max_pending_jobs', MAX_PENDING_JOBS)}\n"
         f"👥 کاربران ثبت‌شده: {len(_users)}\n"
         f"🔖 نسخه: {revision}\n"
         f"🚧 حالت تعمیر: {'روشن' if _config.get('maintenance') else 'خاموش'}"
@@ -1018,6 +1076,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     except Exception as exc:
         logger.exception("خطا در تشخیص فایل کاربر: %s", exc)
+        report_error("recognition", exc)
         if status:
             await status.edit_text("❌ پردازش فایل ناموفق بود؛ دوباره تلاش کنید.")
     finally:
@@ -1110,12 +1169,14 @@ async def _do_video_download(update, context, url):
         )
     except InstagramRateLimitError:
         logger.warning("Instagram درخواست این IP را با 429 محدود کرد")
+        report_error("instagram", "IP rate limited (429)")
         await status.edit_text(
             "❌ در حال حاضر دریافت این رسانه ممکن نشد. لطفاً کمی بعد دوباره تلاش کنید.",
             reply_markup=_back_menu_kb(),
         )
     except Exception as exc:
         logger.exception("خطا در پردازش لینک %s: %s", platform, exc)
+        report_error(platform or "media", exc)
         try:
             await status.edit_text(
                 "❌ پردازش ناموفق بود. چند لحظه بعد دوباره تلاش کنید.",
@@ -1132,14 +1193,39 @@ async def _do_video_download(update, context, url):
 # ---------------------------------------------------------------------------
 # پنل مدیریت
 # ---------------------------------------------------------------------------
-PANEL_TITLE = "🛠 *پنل مدیریت*\nهمه‌ی تنظیمات زنده اعمال می‌شوند."
-LIMITS_TEXT = (
-    "⚙️ *محدودیت‌ها و کارایی*\n\n"
-    "👤 *محدودیت کاربران*: وقتی خاموش باشد، ربات بدون هیچ محدودیتی به همه‌ی "
-    "کاربران سرویس می‌دهد (پیش‌فرض). روشنش کنید تا نرخ درخواست هر کاربر کنترل شود.\n\n"
-    "📥 *دانلود همزمان*: سقف کل سرور. بالاتر = سریع‌تر برای همه، ولی مصرف منابع "
-    "بیشتر (اگر هاست ضعیف است زیاد بالا نبرید)."
-)
+PANEL_TITLE = "🛠 *پنل مدیریت حرفه‌ای*\nتنظیمات بلافاصله و بدون ری‌استارت اعمال می‌شوند."
+
+SETTING_SPECS = {
+    "rate_per_min": ("نرخ هر کاربر / دقیقه", 1, 200, 5),
+    "max_concurrent": ("پردازش همزمان", 1, 30, 1),
+    "max_pending_jobs": ("ظرفیت صف", 1, 200, 5),
+    "max_upload_mb": ("حداکثر فایل (MB)", 5, 49, 2),
+    "music_workers": ("موتور موسیقی همزمان", 1, 10, 1),
+    "music_search_results": ("تعداد نتیجهٔ جستجو", 3, 10, 1),
+    "music_max_minutes": ("حداکثر دقیقهٔ آهنگ", 5, 180, 5),
+    "music_search_timeout": ("مهلت جستجو (ثانیه)", 10, 120, 5),
+    "music_download_timeout": ("مهلت دانلود آهنگ (ثانیه)", 60, 600, 30),
+    "music_bitrate": ("کیفیت MP3 (kbps)", 64, 320, 32),
+    "video_quality": ("کیفیت ویدیو (p)", 240, 1080, 120),
+    "media_timeout": ("مهلت دانلود رسانه (ثانیه)", 30, 180, 15),
+    "download_retries": ("تلاش مجدد", 1, 5, 1),
+}
+
+SETTING_SECTIONS = {
+    "performance": ("⚡ کارایی و صف", ("rate_per_min", "max_concurrent", "max_pending_jobs")),
+    "music": ("🎵 تنظیمات موسیقی", ("music_workers", "music_search_results", "music_max_minutes",
+                                      "music_search_timeout", "music_download_timeout", "music_bitrate")),
+    "media": ("📥 تنظیمات رسانه", ("max_upload_mb", "video_quality", "media_timeout", "download_retries")),
+}
+
+ENGINE_LABELS = {
+    "media_ytdlp": "رسانه: yt-dlp",
+    "media_cobalt": "رسانه: Cobalt",
+    "media_gallery": "رسانه: gallery-dl",
+    "music_youtube": "موسیقی: YouTube",
+    "music_cobalt": "موسیقی: Cobalt",
+    "music_soundcloud": "موسیقی: SoundCloud fallback",
+}
 
 
 def _onoff(b):
@@ -1153,39 +1239,47 @@ def _state(b):
 def admin_panel():
     c = _config
     rows = [
-        [InlineKeyboardButton("📊  آمار و وضعیت", callback_data="adm:stats")],
-        [InlineKeyboardButton("🧩  مدیریت سرویس‌ها", callback_data="adm:services")],
+        [InlineKeyboardButton("📊 وضعیت زنده", callback_data="adm:stats"),
+         InlineKeyboardButton("🧾 خطاهای اخیر", callback_data="adm:errors")],
+        [InlineKeyboardButton("🧩 سرویس‌ها", callback_data="adm:services"),
+         InlineKeyboardButton("🔌 موتورهای دانلود", callback_data="adm:engines")],
+        [InlineKeyboardButton("⚡ کارایی و صف", callback_data="adm:settings:performance"),
+         InlineKeyboardButton("🎵 تنظیمات موسیقی", callback_data="adm:settings:music")],
+        [InlineKeyboardButton("📥 تنظیمات رسانه", callback_data="adm:settings:media"),
+         InlineKeyboardButton(f"👤 محدودیت کاربر {_onoff(c.get('user_limits'))}",
+                              callback_data="adm:toggle:user_limits")],
         [InlineKeyboardButton(f"🔒  قفل عضویت اجباری — {_state(c['force_join'])}",
                               callback_data="adm:toggle:force_join")],
         [InlineKeyboardButton("📢  مدیریت کانال‌ها", callback_data="adm:channels")],
-        [InlineKeyboardButton("⚙️  محدودیت‌ها و کارایی", callback_data="adm:limits")],
         [InlineKeyboardButton(f"🚧  حالت تعمیر — {_state(c['maintenance'])}",
                               callback_data="adm:toggle:maintenance")],
-        [InlineKeyboardButton("✉️  ارسال پیام همگانی", callback_data="adm:broadcast")],
-        [InlineKeyboardButton("✏️  ویرایش پیام خوش‌آمد", callback_data="adm:welcome")],
+        [InlineKeyboardButton("✉️ پیام همگانی", callback_data="adm:broadcast"),
+         InlineKeyboardButton("✏️ پیام خوش‌آمد", callback_data="adm:welcome")],
+        [InlineKeyboardButton("♻️ بازنشانی تنظیمات", callback_data="adm:reset:confirm")],
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def limits_panel():
-    c = _config
-    rows = [
-        [InlineKeyboardButton(f"👤  محدودیت کاربران — {_state(c.get('user_limits'))}",
-                              callback_data="adm:toggle:user_limits")],
-        [
-            InlineKeyboardButton("➖", callback_data="adm:lim:rate:dec"),
-            InlineKeyboardButton(f"نرخ هر کاربر: {c.get('rate_per_min')}/دقیقه",
-                                 callback_data="adm:noop"),
-            InlineKeyboardButton("➕", callback_data="adm:lim:rate:inc"),
-        ],
-        [
-            InlineKeyboardButton("➖", callback_data="adm:lim:conc:dec"),
-            InlineKeyboardButton(f"دانلود همزمان: {c.get('max_concurrent')}",
-                                 callback_data="adm:noop"),
-            InlineKeyboardButton("➕", callback_data="adm:lim:conc:inc"),
-        ],
-        [InlineKeyboardButton("⬅️  بازگشت", callback_data="adm:home")],
-    ]
+def settings_panel(section):
+    title, fields = SETTING_SECTIONS[section]
+    rows = []
+    for key in fields:
+        label, _, _, _ = SETTING_SPECS[key]
+        rows.append([
+            InlineKeyboardButton("➖", callback_data=f"adm:set:{key}:dec"),
+            InlineKeyboardButton(f"{label}: {_config.get(key)}", callback_data="adm:noop"),
+            InlineKeyboardButton("➕", callback_data=f"adm:set:{key}:inc"),
+        ])
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")])
+    return title, InlineKeyboardMarkup(rows)
+
+
+def engines_panel():
+    engines = _config.get("engines", {})
+    rows = [[InlineKeyboardButton(
+        f"{_onoff(engines.get(key, True))} {label}", callback_data=f"adm:engine:{key}")]
+        for key, label in ENGINE_LABELS.items()]
+    rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1245,15 +1339,19 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c = _config
         svc = c["services"]
         txt = (
-            "📊 *آمار و وضعیت*\n\n"
+            "📊 *وضعیت زندهٔ ربات*\n\n"
             f"👥 کاربران: {len(_users)}\n"
-            f"📥 دانلودهای فعال: {_limiter.active}\n\n"
+            f"⚙️ کارهای فعال: {len(_user_busy)}/{c['max_pending_jobs']}\n"
+            f"📥 پردازش همزمان: {_limiter.active}/{c['max_concurrent']}\n"
+            f"🎵 Worker موسیقی: {getattr(_music_ui, 'worker_active', 0)}/{c['music_workers']}\n"
+            f"🧾 خطاهای ذخیره‌شده: {len(_recent_errors)}\n\n"
             f"🔒 قفل عضویت: {'روشن' if c['force_join'] else 'خاموش'}\n"
             f"📢 کانال‌ها: {', '.join(c['channels']) or '—'}\n"
             f"🚧 حالت تعمیر: {'روشن' if c['maintenance'] else 'خاموش'}\n"
             f"👤 محدودیت کاربران: {'روشن' if c['user_limits'] else 'خاموش'} "
             f"({c['rate_per_min']}/دقیقه)\n"
-            f"📥 سقف دانلود همزمان: {c['max_concurrent']}\n\n"
+            f"📦 سقف فایل: {c['max_upload_mb']} MB (حد سخت Telegram: 49 MB)\n"
+            f"🎧 حداکثر آهنگ: {c['music_max_minutes']} دقیقه\n\n"
             "🧩 سرویس‌ها:\n"
             f"  اینستاگرام {_onoff(svc['instagram'])}  فیسبوک {_onoff(svc['facebook'])}\n"
             "  🎵 استخراج و تشخیص موسیقی: خودکار برای هر ویدیو\n"
@@ -1264,35 +1362,101 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [[InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")]]),
         )
 
-    elif data == "limits":
+    elif data == "limits":  # سازگاری با دکمه‌های نسخه‌های قبلی
         await query.answer()
-        await query.edit_message_text(LIMITS_TEXT, parse_mode="Markdown",
-                                      reply_markup=limits_panel())
+        title, keyboard = settings_panel("performance")
+        await query.edit_message_text(title, reply_markup=keyboard)
 
-    elif data.startswith("lim:"):
-        _, field, op = data.split(":")
-        if field == "rate":
-            step = 5 if op == "inc" else -5
-            _config["rate_per_min"] = max(1, int(_config.get("rate_per_min", 15)) + step)
-        else:  # conc
-            step = 1 if op == "inc" else -1
-            _config["max_concurrent"] = max(1, min(50, int(_config.get("max_concurrent", 6)) + step))
+    elif data.startswith("settings:"):
+        section = data.split(":", 1)[1]
+        if section not in SETTING_SECTIONS:
+            await query.answer("تنظیم نامعتبر است.", show_alert=True)
+            return
+        await query.answer()
+        title, keyboard = settings_panel(section)
+        await query.edit_message_text(title, reply_markup=keyboard)
+
+    elif data.startswith("set:"):
+        _, key, op = data.split(":", 2)
+        if key not in SETTING_SPECS or op not in ("inc", "dec"):
+            await query.answer("تنظیم نامعتبر است.", show_alert=True)
+            return
+        _, minimum, maximum, step = SETTING_SPECS[key]
+        current = int(_config.get(key, minimum))
+        _config[key] = max(minimum, min(maximum, current + (step if op == "inc" else -step)))
         save_config()
         await query.answer("تغییر کرد ✅")
-        await query.edit_message_text(LIMITS_TEXT, parse_mode="Markdown",
-                                      reply_markup=limits_panel())
+        section = next(name for name, (_, fields) in SETTING_SECTIONS.items() if key in fields)
+        title, keyboard = settings_panel(section)
+        await query.edit_message_text(title, reply_markup=keyboard)
 
     elif data.startswith("toggle:"):
         key = data.split(":", 1)[1]
+        if key not in ("user_limits", "force_join", "maintenance"):
+            await query.answer("تنظیم نامعتبر است.", show_alert=True)
+            return
         _config[key] = not _config.get(key, False)
         save_config()
         await query.answer("تغییر کرد ✅")
-        if key == "user_limits":
-            await query.edit_message_text(LIMITS_TEXT, parse_mode="Markdown",
-                                          reply_markup=limits_panel())
+        await query.edit_message_text(PANEL_TITLE, parse_mode="Markdown",
+                                      reply_markup=admin_panel())
+
+    elif data == "engines":
+        await query.answer()
+        await query.edit_message_text(
+            "🔌 موتورهای دانلود\nحداقل یک موتور هر بخش را روشن نگه دارید.",
+            reply_markup=engines_panel())
+
+    elif data.startswith("engine:"):
+        key = data.split(":", 1)[1]
+        if key not in ENGINE_LABELS:
+            await query.answer("موتور نامعتبر است.", show_alert=True)
+            return
+        _config.setdefault("engines", {})[key] = not _config["engines"].get(key, True)
+        save_config()
+        await query.answer("تغییر کرد ✅")
+        await query.edit_message_text(
+            "🔌 موتورهای دانلود\nحداقل یک موتور هر بخش را روشن نگه دارید.",
+            reply_markup=engines_panel())
+
+    elif data == "errors":
+        await query.answer()
+        if _recent_errors:
+            lines = ["🧾 خطاهای فنی اخیر (جدیدترین اول):", ""]
+            lines.extend(
+                f"{item['time']} | {item['category']}\n{item['message']}"
+                for item in list(_recent_errors)[:12]
+            )
+            text = "\n\n".join(lines)[:3900]
         else:
-            await query.edit_message_text(PANEL_TITLE, parse_mode="Markdown",
-                                          reply_markup=admin_panel())
+            text = "✅ هنوز خطای فنی ثبت نشده است."
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 پاک‌کردن گزارش", callback_data="adm:errors:clear")],
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")],
+        ]))
+
+    elif data == "errors:clear":
+        _recent_errors.clear()
+        await query.answer("گزارش پاک شد ✅")
+        await query.edit_message_text("✅ گزارش خطاها خالی است.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ بازگشت", callback_data="adm:home")]
+        ]))
+
+    elif data == "reset:confirm":
+        await query.answer()
+        await query.edit_message_text(
+            "⚠️ همهٔ تنظیمات پنل به پیش‌فرض برگردد؟ کاربران و علاقه‌مندی‌ها حذف نمی‌شوند.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ بله، بازنشانی", callback_data="adm:reset:yes"),
+                InlineKeyboardButton("❌ لغو", callback_data="adm:home"),
+            ]]))
+
+    elif data == "reset:yes":
+        _config.clear()
+        _config.update(copy.deepcopy(DEFAULT_CONFIG))
+        save_config()
+        await query.answer("بازنشانی شد ✅")
+        await query.edit_message_text(PANEL_TITLE, parse_mode="Markdown", reply_markup=admin_panel())
 
     elif data == "services":
         await query.answer()
@@ -1300,6 +1464,9 @@ async def on_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("svc:"):
         key = data.split(":", 1)[1]
+        if key not in _config["services"]:
+            await query.answer("سرویس نامعتبر است.", show_alert=True)
+            return
         _config["services"][key] = not _config["services"].get(key, True)
         save_config()
         await query.answer("تغییر کرد ✅")
@@ -1382,6 +1549,7 @@ async def _broadcast(update, context, text):
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
+    report_error("telegram", error)
     update_id = getattr(update, "update_id", "unknown")
     if isinstance(error, RetryAfter):
         logger.warning("محدودیت تلگرام برای آپدیت %s؛ تلاش مجدد پس از %s ثانیه", update_id, error.retry_after)
@@ -1437,6 +1605,7 @@ def main():
     _music_ui = MusicUI(
         DATA_DIR, BOT_TOKEN.split(":", 1)[0], lambda: _config,
         _acquire_job, _user_busy.discard, _limiter, require_membership, is_admin,
+        report_error,
     )
     logger.info("ادمین‌ها: %s | کاربران ذخیره‌شده: %d", ADMIN_IDS or "—", len(_users))
 
