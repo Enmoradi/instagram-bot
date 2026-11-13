@@ -21,6 +21,7 @@ def namespace():
     names = {'detect_platform', 'normalize_media_url', '_acquire_job',
              '_rate_limited', '_do_video_download', 'handle_audio',
              '_send_media_file', 'download_media', 'InstagramRateLimitError',
+             'InstagramAuthenticationError', '_looks_like_instagram_access_block',
              '_max_upload_bytes'}
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in names]
     env = dict(globals(), _user_busy=set(), _user_hits={},
@@ -29,7 +30,7 @@ def namespace():
                MAX_PENDING_JOBS=2, MAX_TELEGRAM_BYTES=100, MAX_PHOTO_BYTES=10,
                is_admin=lambda uid: False, track_user=lambda uid: None,
                require_membership=AsyncMock(return_value=True),
-               report_error=Mock(),
+               report_error=Mock(), _instagram_auth_status=lambda: 'missing',
                _SHAZAM_AVAILABLE=True, SERVICE_LABELS={'instagram': 'Instagram'},
                logger=logging.getLogger('test'),
                ChatAction=SimpleNamespace(UPLOAD_PHOTO='photo', UPLOAD_VIDEO='video', UPLOAD_VOICE='audio'))
@@ -101,6 +102,17 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         result = self.env['download_media']('https://instagram.com/p/a', 'unused')
         self.assertEqual(result[0], 'media.mp4')
         fallback.assert_called_once()
+
+    def test_instagram_login_block_becomes_actionable_auth_error(self):
+        auth_error = self.env['InstagramAuthenticationError']
+        self.env.update(
+            download_video=Mock(side_effect=auth_error('redirected to the login page')),
+            COBALT_API_URL='', download_via_cobalt=Mock(),
+            download_via_gallery_dl=Mock(side_effect=RuntimeError('accounts/login')),
+            _clear_download_dir=Mock(),
+        )
+        with self.assertRaisesRegex(auth_error, 'authentication required'):
+            self.env['download_media']('https://instagram.com/reel/a', 'unused')
 
 
 if __name__ == '__main__':

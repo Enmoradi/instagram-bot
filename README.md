@@ -107,13 +107,21 @@ python bot.py
 ## پایداری Instagram و خطای 429
 
 Instagram گاهی IPهای اشتراکی دیتاسنترها مانند Render را حتی برای محتوای عمومی محدود می‌کند.
-ربات روی 429 فوراً متوقف می‌شود تا مسدودیت را شدیدتر نکند و از این مسیرهای رسمی yt-dlp پشتیبانی می‌کند:
+ربات روی همان موتور تلاش تکراری نمی‌کند، اما موتور مستقل بعدی را امتحان می‌کند. اگر هر سه مسیر به Login/429 برسند، پنل ادمین علت را با وضعیت امن Cookie نشان می‌دهد. مسیرهای احراز هویت پشتیبانی‌شده:
 
 1. Cookie تازه با فرمت Netscape در `INSTAGRAM_COOKIES_B64`
 2. User-Agent هماهنگ در `BROWSER_USER_AGENT`
 3. Proxy سالم در `PROXY_URLS`
 
 Cookie و Proxy محرمانه‌اند و نباید داخل مخزن Commit شوند.
+
+برای ساخت مقدار Base64 در PowerShell، پس از صادرکردن Cookie با فرمت Netscape اجرا کنید:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\path\to\cookies.txt'))
+```
+
+خروجی را فقط در Render → Environment با نام `INSTAGRAM_COOKIES_B64` ثبت کنید و سرویس را دوباره Deploy کنید. از داخل `/admin` گزینهٔ «وضعیت دسترسی منابع» باید `Cookie دارای sessionid` را سبز نشان دهد. خود Cookie یا رمز Instagram را در تلگرام، GitHub یا فایل `.env` عمومی نفرستید.
 
 ## Reliability and testing
 
@@ -122,7 +130,7 @@ Cookie و Proxy محرمانه‌اند و نباید داخل مخزن Commit �
 - Video/audio uploads are capped at 49 MiB. Images over 9 MiB and WebM/MKV files are sent as documents. Oversized files are rejected rather than automatically compressed.
 - Music recognition uses a 45-second sample and a 60-second recognition timeout. Direct Telegram recognition uploads must be at most 20 MiB unless usable audio metadata is provided.
 - `FULL_SONG_DOWNLOAD=true` enables best-match YouTube song search and MP3 conversion. Search results are not guaranteed to be the exact recording. FFmpeg is required.
-- Instagram HTTP 429 stops the fallback chain to avoid additional rate-limited requests.
+- Instagram login/429 stops retries on the affected engine while independent fallback engines continue; after all fail, the owner receives an actionable authentication status.
 - Settings and user lists still require a persistent `DATA_DIR` to survive redeploys; the included free Render configuration does not provision persistent storage.
 
 Install `requirements.txt`, then run offline regression tests with `python -m unittest discover -s tests -v`.
