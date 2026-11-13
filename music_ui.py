@@ -22,16 +22,25 @@ from lyrics import fetch_lyrics
 log = logging.getLogger(__name__)
 
 
-async def run_worker(action, value, directory=None):
+async def run_worker(action, value, directory=None, query=None, settings=None):
     args = [sys.executable, '-m', 'music_worker', action, value]
     if directory:
         args.append(directory)
+    if query:
+        args.append(query)
+    env = os.environ.copy()
+    for key, setting in (settings or {}).items():
+        env[str(key)] = str(setting)
     process = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=(os.name != 'nt'),
+        start_new_session=(os.name != 'nt'), env=env,
     )
     try:
-        out, _ = await asyncio.wait_for(process.communicate(), 25 if action == 'search' else 180)
+        timeout = int((settings or {}).get(
+            'MUSIC_SEARCH_TIMEOUT' if action == 'search' else 'MUSIC_DOWNLOAD_TIMEOUT',
+            35 if action == 'search' else 240,
+        ))
+        out, err = await asyncio.wait_for(process.communicate(), timeout)
     except BaseException:
         if process.returncode is None:
             try:
@@ -44,19 +53,22 @@ async def run_worker(action, value, directory=None):
         await process.communicate()
         raise
     if process.returncode:
-        raise RuntimeError('Music provider unavailable')
+        detail = ' '.join(err.decode('utf-8', errors='replace').split())[-300:]
+        raise RuntimeError(detail or 'Music provider unavailable')
     return json.loads(out)
 
 
 class MusicUI:
-    def __init__(self, data_dir, bot_id, config, acquire, release, limiter, membership, admin):
+    def __init__(self, data_dir, bot_id, config, acquire, release, limiter, membership, admin,
+                 reporter=None):
         self.store = MusicStore(os.path.join(data_dir, f'music_{bot_id}.sqlite3'))
         self.config = config
         self.acquire, self.release, self.limiter = acquire, release, limiter
         self.membership, self.admin = membership, admin
+        self.reporter = reporter or (lambda category, error: None)
         self.search_cache = OrderedDict()
         self.inline_active = set()
-        self.worker_slots = asyncio.Semaphore(3)
+        self.worker_active = 0
 
     def register(self, app):
         app.add_handler(CommandHandler('search', self.search_command))
@@ -76,12 +88,33 @@ class MusicUI:
         return await self.membership(update, context, update.effective_user.id)
 
     async def worker(self, *args):
-        # A timeout while waiting for a slot prevents an unbounded subprocess queue.
-        await asyncio.wait_for(self.worker_slots.acquire(), 3)
+        config = self.config()
+        deadline = time.monotonic() + 10
+        cap = max(1, min(10, int(config.get('music_workers', 3))))
+        while self.worker_active >= cap:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Music worker queue is full')
+            await asyncio.sleep(0.1)
+        self.worker_active += 1
+        engines = config.get('engines', {})
+        settings = {
+            'MUSIC_MAX_MINUTES': max(1, min(180, int(config.get('music_max_minutes', 60)))),
+            'MUSIC_MAX_MB': max(5, min(49, int(config.get('max_upload_mb', 49)))),
+            'MUSIC_SEARCH_RESULTS': max(3, min(10, int(config.get('music_search_results', 5)))),
+            'MUSIC_SEARCH_TIMEOUT': max(10, min(120, int(config.get('music_search_timeout', 35)))),
+            'MUSIC_DOWNLOAD_TIMEOUT': max(60, min(600, int(config.get('music_download_timeout', 240)))),
+            'MUSIC_RETRIES': max(1, min(5, int(config.get('download_retries', 2)))),
+            'MUSIC_BITRATE': int(config.get('music_bitrate', 128)),
+            'MUSIC_YOUTUBE_ENABLED': int(engines.get('music_youtube', True)),
+            'MUSIC_COBALT_ENABLED': int(engines.get('music_cobalt', True)),
+            'MUSIC_SOUNDCLOUD_ENABLED': int(engines.get('music_soundcloud', True)),
+            'MUSIC_COBALT_API_URL': os.environ.get(
+                'MUSIC_COBALT_API_URL', 'https://media-cobalt-api-9rrt.onrender.com'),
+        }
         try:
-            return await run_worker(*args)
+            return await run_worker(*args, settings=settings)
         finally:
-            self.worker_slots.release()
+            self.worker_active = max(0, self.worker_active - 1)
 
     async def search_tracks(self, query):
         query = ' '.join(query.split())[:200]
@@ -148,8 +181,9 @@ class MusicUI:
                 'آهنگی پیدا نشد؛ نام خواننده را اضافه کنید یا عبارت دیگری بفرستید.',
                 reply_markup=self.results_keyboard(tracks),
             )
-        except Exception:
+        except Exception as exc:
             log.warning('Music search failed', exc_info=True)
+            self.reporter('music-search', exc)
             if status:
                 await status.edit_text('جستجو فعلاً در دسترس نیست؛ کمی بعد دوباره تلاش کنید.')
         finally:
@@ -183,17 +217,26 @@ class MusicUI:
                         self.store.cache(key, None)
                 if sent is None:
                     with tempfile.TemporaryDirectory(prefix='music_') as directory:
-                        await self.worker('download', track['source_id'], directory)
+                        query = (track['title'] + ' ' + track['artist']).strip()
+                        await self.worker('download', track['source_id'], directory, query)
                         with open(os.path.join(directory, 'music.mp3'), 'rb') as audio:
                             sent = await context.bot.send_audio(audio=audio, write_timeout=120, **kwargs)
                 if sent.audio:
                     self.store.cache(key, sent.audio.file_id)
                 self.store.remember(uid, key)
             await status.edit_text('✅ آهنگ ارسال شد. نام آهنگ بعدی یا یک وویس بفرستید.')
-        except Exception:
+        except Exception as exc:
             log.warning('Music delivery failed', exc_info=True)
+            self.reporter('music-download', exc)
             if status:
-                await status.edit_text('دریافت این نسخه ممکن نشد؛ یک نتیجهٔ دیگر انتخاب کنید. آهنگ باید کمتر از ۱۵ دقیقه باشد.')
+                search = quote_plus((track['title'] + ' ' + track['artist']).strip())
+                await status.edit_text(
+                    'منابع دانلود مستقیم این نسخه پاسخ ندادند. نتیجهٔ دیگری را امتحان کنید یا از لینک‌های شنیدن استفاده کنید.',
+                    reply_markup=Keyboard([
+                        [Button('▶️ YouTube Music', url='https://music.youtube.com/search?q=' + search),
+                         Button('🟢 Spotify', url='https://open.spotify.com/search/' + search)],
+                        [Button('🔎 نتیجهٔ دیگر', callback_data='music:search')],
+                    ]))
         finally:
             self.release(uid)
 
@@ -260,8 +303,9 @@ class MusicUI:
                 else:
                     await context.bot.send_document(update.effective_chat.id,
                         document=io.BytesIO(content.encode('utf-8')), filename='lyrics.txt', caption=heading)
-        except Exception:
+        except Exception as exc:
             log.warning('Lyrics lookup failed', exc_info=True)
+            self.reporter('lyrics', exc)
             await update.effective_message.reply_text('سرویس متن ترانه فعلاً پاسخ نداد؛ کمی بعد دوباره تلاش کنید.')
         finally:
             self.release(uid)
@@ -331,8 +375,9 @@ class MusicUI:
                     input_message_content=InputTextMessageContent('🎵 ' + track['title'] + '\n' + track['artist'] + '\n' + url),
                     reply_markup=Keyboard([[Button('🎧 دریافت MP3 در ربات', url=url)]])))
             await inline.answer(results, cache_time=30, is_personal=True)
-        except Exception:
+        except Exception as exc:
             log.warning('Inline music search failed', exc_info=True)
+            self.reporter('inline-search', exc)
             await inline.answer([], cache_time=1, is_personal=True)
         finally:
             self.inline_active.discard(uid)

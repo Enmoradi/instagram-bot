@@ -20,13 +20,16 @@ def namespace():
     tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
     names = {'detect_platform', 'normalize_media_url', '_acquire_job',
              '_rate_limited', '_do_video_download', 'handle_audio',
-             '_send_media_file', 'download_media', 'InstagramRateLimitError'}
+             '_send_media_file', 'download_media', 'InstagramRateLimitError',
+             '_max_upload_bytes'}
     nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name in names]
     env = dict(globals(), _user_busy=set(), _user_hits={},
-               _config={'user_limits': True, 'rate_per_min': 2, 'services': {'instagram': True}},
+               _config={'user_limits': True, 'rate_per_min': 2, 'max_upload_mb': 49,
+                        'max_pending_jobs': 2, 'services': {'instagram': True}, 'engines': {}},
                MAX_PENDING_JOBS=2, MAX_TELEGRAM_BYTES=100, MAX_PHOTO_BYTES=10,
                is_admin=lambda uid: False, track_user=lambda uid: None,
                require_membership=AsyncMock(return_value=True),
+               report_error=Mock(),
                _SHAZAM_AVAILABLE=True, SERVICE_LABELS={'instagram': 'Instagram'},
                logger=logging.getLogger('test'),
                ChatAction=SimpleNamespace(UPLOAD_PHOTO='photo', UPLOAD_VIDEO='video', UPLOAD_VOICE='audio'))
@@ -89,15 +92,15 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.send_document.await_count, 2)
         bot.send_photo.assert_not_called()
 
-    def test_429_stops_fallbacks(self):
+    def test_429_uses_independent_fallback(self):
         error = self.env['InstagramRateLimitError']
-        fallback = Mock()
+        fallback = Mock(return_value=('media.mp4', '', 'Instagram'))
         self.env.update(download_video=Mock(side_effect=error('429')),
                         COBALT_API_URL='https://example.test', download_via_cobalt=fallback,
-                        download_via_gallery_dl=fallback, _clear_download_dir=Mock())
-        with self.assertRaises(error):
-            self.env['download_media']('https://instagram.com/p/a', 'unused')
-        fallback.assert_not_called()
+                        download_via_gallery_dl=Mock(), _clear_download_dir=Mock())
+        result = self.env['download_media']('https://instagram.com/p/a', 'unused')
+        self.assertEqual(result[0], 'media.mp4')
+        fallback.assert_called_once()
 
 
 if __name__ == '__main__':
